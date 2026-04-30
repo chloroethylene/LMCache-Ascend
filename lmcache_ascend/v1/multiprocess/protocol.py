@@ -10,7 +10,7 @@ Protocol definitions are loaded and validated during initialization.
 from typing import Any, Optional
 
 # First Party
-from lmcache.v1.multiprocess.custom_types import IPCCacheEngineKey
+from lmcache_ascend.v1.multiprocess.custom_types import IPCCacheEngineKey
 from lmcache.v1.multiprocess.protocols import initialize_protocols
 from lmcache.v1.multiprocess.protocols.base import HandlerType, RequestType
 
