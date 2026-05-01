@@ -1,18 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 import pickle
 import re
 import subprocess
-import threading
 
 # Third Party
 import msgspec
 import torch
 
 # First Party
+# Reuse IPCCacheEngineKey and BlockAllocationRecord from LMCache
+from lmcache.v1.multiprocess.custom_types import (
+    IPCCacheEngineKey as IPCCacheEngineKeyBase,
+    BlockAllocationRecord,
+)
 from lmcache.v1.multiprocess.custom_types import CudaIPCWrapper
+
+
+# Re-export for backwards compatibility
+IPCCacheEngineKey = IPCCacheEngineKeyBase
 
 
 class AscendIPCWrapper(CudaIPCWrapper):
@@ -120,86 +128,8 @@ class AscendIPCWrapper(CudaIPCWrapper):
         return t
 
 
-# Type exports
+# Type exports - KVCache uses AscendIPCWrapper for NPU
 KVCache = list[AscendIPCWrapper]
-
-
-@dataclass(order=True, frozen=True)
-class IPCCacheEngineKey:
-    """Cache key for the IPC (multiprocess) protocol.
-
-    This key type is sent by the client over ZMQ (serialized via msgspec).
-
-    The client sends token_ids, start, end, and request_id (all required).
-    The server computes chunk hashes via TokenHasher and converts to
-    ObjectKey for storage operations using ipc_key_to_object_keys().
-
-    The request_id field is for session tracking and is NOT included
-    in equality/hash comparisons (two keys with same content but different
-    request_ids are considered equal for cache purposes).
-    """
-
-    model_name: str
-    world_size: int
-    worker_id: int | None
-
-    token_ids: tuple[int, ...]  # frozen tuple for hashability
-    start: int
-    end: int
-
-    # === Session tracking (not part of cache identity) ===
-    request_id: str = field(compare=False)
-
-    # === Per-user isolation salt (part of cache identity) ===
-    cache_salt: str = ""
-
-    _SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
-    _SALT_MAX_LEN = 128
-
-    def __post_init__(self) -> None:
-        bad = self._SALT_FORBIDDEN_CHARS & set(self.cache_salt)
-        if bad:
-            raise ValueError(
-                f"cache_salt must not contain {bad!r} (got {self.cache_salt!r})"
-            )
-        if len(self.cache_salt) > self._SALT_MAX_LEN:
-            raise ValueError(
-                f"cache_salt exceeds max length {self._SALT_MAX_LEN} "
-                f"(got {len(self.cache_salt)})"
-            )
-
-    def no_worker_id_version(self) -> "IPCCacheEngineKey":
-        """Create a copy with worker_id=None for lookup requests."""
-        return IPCCacheEngineKey(
-            model_name=self.model_name,
-            world_size=self.world_size,
-            worker_id=None,
-            token_ids=self.token_ids,
-            start=self.start,
-            end=self.end,
-            request_id=self.request_id,
-            cache_salt=self.cache_salt,
-        )
-
-
-@dataclass
-class BlockAllocationRecord:
-    """A single per-request GPU block allocation delta from vLLM."""
-
-    req_id: str
-    new_block_ids: list[int]
-    new_token_ids: list[int]
-
-
-@dataclass
-class CBMatchResult:
-    """Result of a sub-sequence match from BlendTokenRangeMatcher."""
-
-    old_st: int
-    old_ed: int
-    cur_st: int
-    cur_ed: int
-    hash: bytes
 
 
 @dataclass

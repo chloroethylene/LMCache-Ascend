@@ -61,7 +61,7 @@ from lmcache_ascend.v1.multiprocess.custom_types import (
     KVCache,
 )
 from lmcache_ascend.v1.multiprocess.gpu_context import NPUCacheContext
-from lmcache_ascend.v1.multiprocess.session import SessionManager
+from lmcache.v1.multiprocess.session import SessionManager
 from lmcache_ascend.v1.multiprocess.token_hasher import TokenHasher
 from lmcache_ascend.v1.multiprocess.mq import MessageQueueServer
 from lmcache_ascend.v1.multiprocess.futures import NPUMessagingFuture
