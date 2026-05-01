@@ -264,10 +264,17 @@ def _patch_torch_capability():
     # Third Party
     from torch_npu.contrib import transfer_to_npu  # noqa: F401
     import torch
+    from unittest.mock import MagicMock
 
     # Note: torch_npu do not support get_device_capability
     capability_mock = lambda *args: (0, 0)
     torch.npu.get_device_capability = capability_mock
+
+    # Patch torch.cuda.cudart to return a mock on NPU systems
+    # This is needed because lmcache.v1.lazy_memory_allocator calls
+    # torch.cuda.cudart() which fails on NPU (PyTorch not compiled with CUDA)
+    if hasattr(torch.cuda, 'cudart'):
+        torch.cuda.cudart = MagicMock(return_value=MagicMock())
 
 
 def _patch_transfer_channel():
@@ -296,9 +303,19 @@ def _patch_multi_process():
     import lmcache.v1.multiprocess.custom_types as lm_mp_types
 
     # First Party
-    from lmcache_ascend.v1.multiprocess.custom_types import AscendIPCWrapper
+    from lmcache_ascend.v1.multiprocess.custom_types import (
+        AscendIPCWrapper,
+        BlockAllocationRecord,
+        IPCCacheEngineKey,
+    )
 
     lm_mp_types.CudaIPCWrapper = AscendIPCWrapper
+
+    # Also update the KVCache and IPCCacheEngineKey type aliases so that
+    # protocol definitions use the correct types for STORE/RETRIEVE payloads.
+    lm_mp_types.KVCache = list[AscendIPCWrapper]
+    lm_mp_types.IPCCacheEngineKey = IPCCacheEngineKey
+    lm_mp_types.BlockAllocationRecord = BlockAllocationRecord
 
 
 def _patch_kv_layer_group():
@@ -498,6 +515,21 @@ def _patch_sgl():
     lmc_memory_management.GPUMemoryAllocator.__init__ = GPUMemoryAllocator__init__
 
 
+def _patch_native_storage_ops():
+    # Stub lmcache.native_storage_ops with our Python fallback when
+    # the C++ extension is not available (e.g., NO_CUDA_EXT=1 build).
+    # This allows the multiprocess server to run without the CUDA extension.
+    import sys
+    from unittest.mock import MagicMock
+    import importlib.util
+
+    if importlib.util.find_spec("lmcache.native_storage_ops") is not None:
+        return  # Real extension exists, no need to stub
+
+    from lmcache_ascend import native_storage_ops as ascend_native_ops
+    sys.modules["lmcache.native_storage_ops"] = ascend_native_ops
+
+
 def _patch_rpc_utils():
     # Patching this to fix socket path length issues on some systems.
     # The original socket path can exceed Unix domain socket's 107 character
@@ -537,6 +569,7 @@ if not LMCACHE_ASCEND_PATCHED:
     import sys
 
     _patch_config()
+    _patch_native_storage_ops()
 
     is_sgl = _is_sglang_runtime()
     is_vllm = _is_vllm_runtime()

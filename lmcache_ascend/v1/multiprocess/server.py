@@ -8,6 +8,9 @@ import argparse
 import threading
 import time
 
+# First Party - import lmcache_ascend first to apply patches before lmcache imports
+import lmcache_ascend  # noqa: F401
+
 # Third Party
 import torch
 import zmq

@@ -514,7 +514,28 @@ class MessageQueueServer:
                 a = type(None)
             if b is None:
                 b = type(None)
-            return a == b
+            # Check if types match or if there's an inheritance relationship
+            if a == b:
+                return True
+            # Handle generic types like list[CudaIPCWrapper] vs list[AscendIPCWrapper]
+            if hasattr(a, '__args__') and hasattr(b, '__args__'):
+                if len(a.__args__) == len(b.__args__):
+                    return all(
+                        same_type(a_arg, b_arg)
+                        for a_arg, b_arg in zip(a.__args__, b.__args__)
+                    )
+            # Handle dataclass equivalence: if both have the same class name
+            # and are from lmcache custom_types variants, consider them equivalent
+            # (e.g., lmcache.BlockAllocationRecord vs lmcache_ascend.BlockAllocationRecord)
+            if (
+                isinstance(a, type)
+                and isinstance(b, type)
+                and a.__name__ == b.__name__
+                and "custom_types" in getattr(a, "__module__", "")
+                and "custom_types" in getattr(b, "__module__", "")
+            ):
+                return True
+            return False
 
         sig = inspect.signature(handler)
         hints = get_type_hints(handler)
