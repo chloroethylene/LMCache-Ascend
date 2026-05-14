@@ -20,17 +20,16 @@ from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.utils import (
     LayoutHints,
+    discover_gpu_kv_format,
     get_attention_backend,
     get_block_size,
     get_concrete_gpu_kv_shape,
-    get_device,
     get_dtype,
     get_gpu_kv_shape_description,
     get_group_data_ptrs,
     get_num_blocks,
     get_num_layers,
     is_mla,
-    normalize_kv_and_discover_format,
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache_ascend.v1.multiprocess.custom_types import (
@@ -89,13 +88,14 @@ class NPUCacheContext:
         layout_hints: LayoutHints | None = None,
         engine_type: EngineType = EngineType.VLLM,
     ):
-        unwrapped = unwrap_kv_cache_tensors(kv_caches)
-        self.gpu_kv_format_, self.kv_caches_ = normalize_kv_and_discover_format(
-            unwrapped,
+        self.kv_caches_ = unwrap_kv_cache_tensors(kv_caches)
+        self.device_ = self.kv_caches_[0].device
+
+        self.gpu_kv_format_ = discover_gpu_kv_format(
+            self.kv_caches_,
             engine_type,
             layout_hints=layout_hints,
         )
-        self.device_ = get_device(self.kv_caches_)
         self.is_mla_ = is_mla(self.gpu_kv_format_)
         self.num_layers_ = get_num_layers(self.kv_caches_, self.gpu_kv_format_)
         self.num_blocks_ = get_num_blocks(self.kv_caches_, self.gpu_kv_format_)

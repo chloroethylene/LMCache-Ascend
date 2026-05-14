@@ -43,8 +43,14 @@ from lmcache.v1.mp_observability.config import (
 )
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
-from lmcache.v1.mp_observability.otel_init import register_gauge
-from lmcache.v1.mp_observability.trace import maybe_initialize_trace_recorder
+try:
+    from lmcache.v1.mp_observability.otel_init import register_gauge
+except ImportError:
+    register_gauge = None
+try:
+    from lmcache.v1.mp_observability.trace import maybe_initialize_trace_recorder
+except ImportError:
+    maybe_initialize_trace_recorder = None
 from lmcache.v1.multiprocess.config import (
     MPServerConfig,
     add_mp_server_args,
@@ -1045,6 +1051,8 @@ class NPUCacheEngine:
 
     def _setup_metrics(self) -> None:
         """Register OTel observable gauges for MP engine metrics."""
+        if register_gauge is None:
+            return
         _gauge = partial(register_gauge, "lmcache.mp_engine")
         _gauge(
             "lmcache_mp.active_prefetch_jobs",
@@ -1091,7 +1099,8 @@ def run_cache_server(
     # Wire up the trace recorder (no-op when --trace-level is unset).
     # Registered before the engine handlers are added so any
     # storage-manager calls during engine init are captured too.
-    maybe_initialize_trace_recorder(event_bus, obs_config, storage_manager_config)
+    if maybe_initialize_trace_recorder is not None:
+        maybe_initialize_trace_recorder(event_bus, obs_config, storage_manager_config)
 
     # Initialize the engine (loggers self-register with the global controller)
     engine = NPUCacheEngine(
