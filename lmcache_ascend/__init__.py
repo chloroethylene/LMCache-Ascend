@@ -286,6 +286,16 @@ def _patch_ops():
     # First Party
     import lmcache_ascend.c_ops as ascend_c_ops
 
+    # Merge fallback functions that ascend c_ops doesn't implement
+    # (e.g., alloc_shm_pinned_ptr, free_shm_pinned_ptr, hugepage
+    # functions).  This must happen BEFORE any downstream module
+    # imports lmcache.c_ops, otherwise the bound reference will miss
+    # these symbols.
+    from lmcache import python_ops_fallback
+    for attr_name in dir(python_ops_fallback):
+        if not attr_name.startswith("__") and not hasattr(ascend_c_ops, attr_name):
+            setattr(ascend_c_ops, attr_name, getattr(python_ops_fallback, attr_name))
+
     # LMCache v0.4.2 introduces GPUKVFormat enum in c_ops (CUDA pybind).
     # Ascend c_ops doesn't have it, so we provide a compatible mock
     # to avoid AttributeError when upstream code references it.
@@ -311,7 +321,7 @@ def _patch_ops():
     # Python equivalent (same __slots__) for Ascend.
     if not hasattr(ascend_c_ops, "PageBufferShapeDesc"):
         # Third Party
-        from lmcache.non_cuda_equivalents import PageBufferShapeDesc
+        from lmcache.python_ops_fallback import PageBufferShapeDesc
 
         ascend_c_ops.PageBufferShapeDesc = PageBufferShapeDesc
 
