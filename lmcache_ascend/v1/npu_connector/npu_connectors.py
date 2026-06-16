@@ -1307,14 +1307,14 @@ class VLLMPagedMemNPUConnectorV2(_V2KVTransferMixin, VLLMPagedMemGPUConnectorV2)
             )
             self.metadata.kv_layer_groups_manager = mgr
         else:
-            gpu_kv_format, normalized = normalize_kv_and_discover_format(
+            engine_kv_format, normalized = normalize_kv_and_discover_format(
                 kv_caches,
                 serving_engine=EngineType.VLLM,
                 layout_hints=hints,
             )
             self.metadata.kv_layer_groups_manager = KVLayerGroupsManager(
                 normalized,
-                gpu_kv_format=gpu_kv_format,
+                engine_kv_format=engine_kv_format,
                 num_blocks=num_blocks,
                 layout_hints=hints,
                 lmcache_logical_chunk_size=self.metadata.chunk_size,
