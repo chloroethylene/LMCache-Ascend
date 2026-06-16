@@ -435,6 +435,21 @@ def _patch_multi_process():
     lm_mp_types.CudaIPCWrapper = AscendIPCWrapper
 
 
+def _patch_mp_transfer_context():
+    """Route MP non-GPU gather/scatter through the fused NPU transfer kernel.
+
+    Replaces ``gather_paged_kv_to_cpu`` / ``scatter_cpu_to_paged_kv`` (on both
+    the ``base`` and ``worker_transfer`` namespaces) with dispatchers that use
+    ``fused_multi_layer_kv_transfer`` for SEPARATE_KV caches on 910B/C NPU,
+    falling back to the upstream PyTorch path otherwise. See
+    :mod:`lmcache_ascend.v1.multiprocess.npu_gather` for scope and limits.
+    """
+    # First Party
+    from lmcache_ascend.v1.multiprocess.npu_gather import install_overrides
+
+    install_overrides()
+
+
 def _patch_gpu_connector():
     """Patch CreateGPUConnector to return NPU connectors on Ascend.
 
@@ -763,6 +778,7 @@ if not LMCACHE_ASCEND_PATCHED:
         _patch_transfer_channel()
         _patch_cacheblend()
         _patch_multi_process()
+        _patch_mp_transfer_context()
         _patch_lookup_client()
         _patch_cache_controller_worker()
         _patch_rpc_utils()
