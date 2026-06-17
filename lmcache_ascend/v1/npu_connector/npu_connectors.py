@@ -195,6 +195,25 @@ def _first_layer_tensor(
     return first
 
 
+# LMC-A: plugin-local KV-group attributes that upstream KernelGroupInfo no longer
+# declares as fields (compress_ratio, physical_chunk_size) plus our own
+# multi_plane_hidden_bytes. dataclasses.replace() copies only declared fields, so
+# whenever we replace() a group we must re-apply these by hand or they silently
+# vanish (regressing compressed / multi-plane chunk sizing).
+_PLUGIN_GROUP_INSTANCE_ATTRS: tuple[str, ...] = (
+    "compress_ratio",
+    "physical_chunk_size",
+    "multi_plane_hidden_bytes",
+)
+
+
+def _copy_plugin_group_attrs(src: Any, dst: Any) -> None:
+    """Re-apply plugin-local instance attrs that dataclasses.replace() drops."""
+    for name in _PLUGIN_GROUP_INSTANCE_ATTRS:
+        if hasattr(src, name):
+            setattr(dst, name, getattr(src, name))
+
+
 # Stage-2 NPU grouping after upstream KVLayerGroupsManager (or build_kv_layer_groups): shape-only
 # buckets can mix flat layers that map to different vLLM scheduler groups (DSv4: ~3 shape groups
 # -> 6 NPU groups). Split so each group has one scheduler_slot_group for store/load.
@@ -213,10 +232,10 @@ def _split_kv_layer_groups_by_scheduler_slot(
     lmcache_logical_chunk_size: int = 256,
 ) -> None:
     """Subdivide upstream groups when flattened layers share a shape but not a slot group."""
-    from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
+    from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, ObjectGroupInfo
 
     split_groups: list[KVLayerGroupInfo] = []
-    for group in manager.kv_layer_groups:
+    for group in manager.kernel_groups:
         buckets: dict[int, list[int]] = defaultdict(list)
         for layer_idx in group.layer_indices:
             buckets[int(sched_map[layer_idx])].append(layer_idx)
@@ -227,13 +246,14 @@ def _split_kv_layer_groups_by_scheduler_slot(
             indices = buckets[sched_g]
             new_sd = copy.copy(group.shape_desc)
             new_sd.nl = len(indices)
-            split_groups.append(
-                dataclasses.replace(
-                    group,
-                    layer_indices=indices,
-                    shape_desc=new_sd,
-                )
+            new_g = dataclasses.replace(
+                group,
+                layer_indices=indices,
+                shape_desc=new_sd,
             )
+            # replace() drops non-field instance attrs; re-apply ours.
+            _copy_plugin_group_attrs(group, new_g)
+            split_groups.append(new_g)
             logger.debug(
                 "Split KV layer group by scheduler_slot_group=%d -> layers=%s",
                 sched_g, indices,
@@ -245,15 +265,20 @@ def _split_kv_layer_groups_by_scheduler_slot(
         for group in split_groups:
             sched_g = int(sched_map[group.layer_indices[0]])
             ratio = max(1, int(ratios[sched_g]))
-            patched.append(
-                dataclasses.replace(
-                    group,
-                    compress_ratio=ratio,
-                    physical_chunk_size=chunk // ratio,
-                )
-            )
+            new_g = dataclasses.replace(group)
+            _copy_plugin_group_attrs(group, new_g)
+            # Override with the ratio-derived sizing for this scheduler group.
+            new_g.compress_ratio = ratio
+            new_g.physical_chunk_size = chunk // ratio
+            patched.append(new_g)
         split_groups = patched
-    manager.kv_layer_groups = split_groups
+    # LMC-A: write the backing field -- upstream made kv_layer_groups a read-only
+    # property. Refresh object_groups to match the (possibly subdivided) kernel
+    # count; upstream's invariant is one object group spanning all kernel groups.
+    manager._kernel_groups = split_groups
+    manager._object_groups = [
+        ObjectGroupInfo(kernel_group_indices=list(range(len(split_groups))))
+    ]
 
 
 def _materialize_mp_device_params(
