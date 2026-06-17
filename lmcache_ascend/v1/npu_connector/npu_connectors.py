@@ -1340,9 +1340,9 @@ class VLLMPagedMemNPUConnectorV2(_V2KVTransferMixin, VLLMPagedMemGPUConnectorV2)
         if (
             self.metadata is not None
             and self.metadata.kv_layer_groups_manager is not None
-            and self.metadata.kv_layer_groups_manager.kv_layer_groups
+            and self.metadata.kv_layer_groups_manager.kernel_groups
         ):
-            sd = self.metadata.kv_layer_groups_manager.kv_layer_groups[0].shape_desc
+            sd = self.metadata.kv_layer_groups_manager.kernel_groups[0].shape_desc
             if getattr(sd, "block_stride_elems", 0) > 0:
                 self._logical_page_slots = int(sd.nb) * int(sd.bs)
 
@@ -1378,14 +1378,14 @@ class VLLMPagedMemNPUConnectorV2(_V2KVTransferMixin, VLLMPagedMemGPUConnectorV2)
             if self.metadata is not None
             else None
         )
-        if klg_manager is None or not klg_manager.kv_layer_groups:
+        if klg_manager is None or not klg_manager.kernel_groups:
             self.group_kv_cache_pointers = None
             self.per_group_params = None
             return
 
         group_pointers: list[torch.Tensor] = []
         group_params: list[dict[str, Any]] = []
-        for group_idx, group in enumerate(klg_manager.kv_layer_groups):
+        for group_idx, group in enumerate(klg_manager.kernel_groups):
             indices = group.layer_indices
             rep = kv_caches[indices[0]]
             if not _is_kernel_compatible_entry(rep):
