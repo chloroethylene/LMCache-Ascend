@@ -1312,12 +1312,19 @@ class VLLMPagedMemNPUConnectorV2(_V2KVTransferMixin, VLLMPagedMemGPUConnectorV2)
                 serving_engine=EngineType.VLLM,
                 layout_hints=hints,
             )
+            # LMC-A: upstream renamed ``layout_hints`` -> ``engine_group_infos``
+            # (PR #3598) and ``lmcache_logical_chunk_size`` ->
+            # ``lmcache_tokens_per_chunk`` (PR #3616). The free-form hints dict
+            # is already consumed by ``normalize_kv_and_discover_format`` above
+            # and by the post-build scheduler split below; the manager itself
+            # derives everything from ``normalized`` + ``num_blocks``, so we
+            # pass no ``engine_group_infos`` (standard single-spec SEPARATE_KV
+            # is non-hybrid -> tokens_per_block falls back to block_size).
             self.metadata.kv_layer_groups_manager = KVLayerGroupsManager(
                 normalized,
                 engine_kv_format=engine_kv_format,
                 num_blocks=num_blocks,
-                layout_hints=hints,
-                lmcache_logical_chunk_size=self.metadata.chunk_size,
+                lmcache_tokens_per_chunk=self.metadata.chunk_size,
             )
         sched_map = hints.get("scheduler_group_by_flat_layer")
         if sched_map is not None:
