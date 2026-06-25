@@ -30,6 +30,20 @@ through to the original upstream implementation unchanged.
    ``kv_lora_rank + qk_rope_head_dim`` layout.  Fixing MLA additionally
    requires correcting that shape contract; tracked as a follow-up.
 
+In addition, ``EngineDrivenTransferContext.submit_store`` / ``submit_retrieve``
+are patched so the fused path runs on a dedicated NPU stream
+(``_NPUTransferDescriptor.transfer_stream``): the whole-device
+``torch_dev.synchronize()`` that orders the gather against the model forward is
+replaced with ``transfer_stream.wait_stream(torch.npu.current_stream())``
+(mirrors the in-process connector at npu_connectors.py:1126). The "forward-
+completion event" the engine passes in is not used: the deployed vLLM connector
+resolves it to a CPU-runner ``_EventPlaceholder`` with no ``.wait`` method, so
+ordering via the current (forward) stream is the robust choice; the two
+pre-commit syncs become stream-scoped ``transfer_stream.synchronize()``. The
+per-chunk D2H/H2D copies are issued ``non_blocking`` on that stream so N host
+syncs collapse to one. Unsupported layouts (and CPU/310P workers) fall back to the
+original upstream methods unchanged.
+
 Heavy dependencies (``c_ops``, the NPU connector helpers) are imported lazily
 so the module and its pure-Python helpers stay importable on hosts without a
 built extension — this keeps the slot-mapping and fallback logic unit-testable.
@@ -40,6 +54,7 @@ from typing import Optional
 
 # Third Party
 from lmcache.logging import init_logger
+from lmcache.v1.multiprocess.futures import MessagingFuture
 import torch
 
 # First Party
@@ -102,6 +117,9 @@ class _NPUTransferDescriptor:
         use_mla: Always ``False`` for the currently supported formats.
         kv_lora_rank / qk_rope_head_dim: MLA plane widths (0 for SEPARATE_KV).
         dtype: Element dtype of the paged KV / contiguous buffer.
+        transfer_stream: Dedicated NPU stream for the paged<->staging DMA and
+            the D2H/H2D leg, so MP transfer does not contend with model
+            kernels on the default stream.
     """
 
     def __init__(self, layers: list[object]) -> None:
@@ -146,6 +164,16 @@ class _NPUTransferDescriptor:
             cpu_ptrs.shape, dtype=torch.int64, device=self.device
         )
         self.ptr_table.copy_(cpu_ptrs)
+
+        # LMC-A: dedicated stream for the paged<->staging DMA + the D2H/H2D
+        # leg so KV transfer no longer contends with model kernels on the
+        # default NPU stream. Created eagerly (mirrors the channel
+        # ``transport_stream`` at hccl_channel.py:104); the descriptor is only
+        # built lazily once a supported NPU layout is registered, so the device
+        # is live by this point.
+        self.transfer_stream: torch.npu.Stream = torch.npu.Stream(
+            device=self.device
+        )
 
         self._staging: Optional[torch.Tensor] = None
 
@@ -241,37 +269,58 @@ def _npu_gather_paged_kv_to_cpu(
     chunks: list[torch.Tensor] = [] if out is None else out
 
     k1, k2, k3, k4 = desc.plane_extras
-    for out_idx, chunk_idx in enumerate(iter_indices):
-        chunk_block_ids = block_ids[
-            chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
-        ]
-        tokens = len(chunk_block_ids) * desc.block_size
-        slot_mapping = _build_slot_mapping(chunk_block_ids, desc.block_size, desc.device)
-        staging = desc.staging_for(kv_lead=2, tokens=tokens)
+    # LMC-A: run the whole per-chunk loop on the dedicated transfer stream so
+    # the paged->staging DMA and the D2H leg do not contend with model kernels
+    # on the default stream. No per-chunk host sync: completion is awaited once
+    # by the caller (EngineDrivenTransferContext.submit_store, via
+    # ``desc.transfer_stream.synchronize()``) before commit. A
+    # ``wait_stream(torch.npu.current_stream())`` is also issued there to order
+    # this stream against the model forward that wrote the paged KV.
+    with torch.npu.stream(desc.transfer_stream):
+        for out_idx, chunk_idx in enumerate(iter_indices):
+            chunk_block_ids = block_ids[
+                chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
+            ]
+            tokens = len(chunk_block_ids) * desc.block_size
+            slot_mapping = _build_slot_mapping(
+                chunk_block_ids, desc.block_size, desc.device
+            )
+            staging = desc.staging_for(kv_lead=2, tokens=tokens)
 
-        # Paged KV -> NPU staging (device-to-device; no host memory involved).
-        lmc_ops.multi_layer_kv_transfer(
-            key_value=staging,
-            key_value_ptrs=desc.ptr_table,
-            slot_mapping=slot_mapping,
-            paged_memory_device=desc.device,
-            page_buffer_size=desc.page_buffer_size,
-            direction=True,  # from_gpu: paged -> staging
-            use_mla=desc.use_mla,
-            kvcache_format_raw=desc.kv_format.value,
-            k_hidden_dims=k1,
-            v_hidden_dims=k2,
-            dsa_hidden_dims=k3,
-            dsa_c8_scale_plane_bytes=k4,
-            paged_kv_block_size=desc.block_size,
-        )
+            # Paged KV -> NPU staging (device-to-device; no host memory involved).
+            lmc_ops.multi_layer_kv_transfer(
+                key_value=staging,
+                key_value_ptrs=desc.ptr_table,
+                slot_mapping=slot_mapping,
+                paged_memory_device=desc.device,
+                page_buffer_size=desc.page_buffer_size,
+                direction=True,  # from_gpu: paged -> staging
+                use_mla=desc.use_mla,
+                kvcache_format_raw=desc.kv_format.value,
+                k_hidden_dims=k1,
+                v_hidden_dims=k2,
+                dsa_hidden_dims=k3,
+                dsa_c8_scale_plane_bytes=k4,
+                paged_kv_block_size=desc.block_size,
+            )
 
-        # D2H via torch (handles host allocation/registration internally), so
-        # any host buffer — SHM views or freshly allocated CPU tensors — works.
-        if out is not None:
-            out[out_idx].copy_(staging)
-        else:
-            chunks.append(staging.cpu())
+            # D2H on the transfer stream. ``non_blocking=True`` needs a pinned
+            # host dst for a truly async copy; SHM mmap views are not pinned so
+            # torch falls back to a synchronous copy there, but the call still
+            # lands on the transfer stream and the single post-loop stream sync
+            # (caller) guarantees completion before commit. The non-SHM path
+            # uses a pinned CPU buffer so it is genuinely async.
+            if out is not None:
+                out[out_idx].copy_(staging, non_blocking=True)
+            else:
+                dst = torch.empty(
+                    staging.shape,
+                    dtype=staging.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                dst.copy_(staging, non_blocking=True)
+                chunks.append(dst)
 
     return chunks
 
@@ -293,54 +342,68 @@ def _npu_scatter_cpu_to_paged_kv(
     num_chunks = len(block_ids) // blocks_per_chunk
     k1, k2, k3, k4 = desc.plane_extras
 
-    for chunk_idx in range(min(num_chunks, len(chunks))):
-        chunk_block_ids = list(
-            block_ids[chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk]
-        )
-        chunk_start = chunk_idx * blocks_per_chunk * desc.block_size
-        chunk_end = chunk_start + len(chunk_block_ids) * desc.block_size
-        effective_start = max(chunk_start, skip_first_n_tokens)
-        if effective_start >= chunk_end:
-            continue
+    # LMC-A: run the scatter on the dedicated transfer stream (mirrors the
+    # gather path); completion is awaited once by the caller
+    # (EngineDrivenTransferContext.submit_retrieve, via
+    # ``desc.transfer_stream.synchronize()``) before the SHM slot is released.
+    with torch.npu.stream(desc.transfer_stream):
+        for chunk_idx in range(min(num_chunks, len(chunks))):
+            chunk_block_ids = list(
+                block_ids[
+                    chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
+                ]
+            )
+            chunk_start = chunk_idx * blocks_per_chunk * desc.block_size
+            chunk_end = chunk_start + len(chunk_block_ids) * desc.block_size
+            effective_start = max(chunk_start, skip_first_n_tokens)
+            if effective_start >= chunk_end:
+                continue
 
-        skip_blocks = (effective_start - chunk_start) // desc.block_size
-        skip_tokens = skip_blocks * desc.block_size
-        eff_block_ids = chunk_block_ids[skip_blocks:]
-        eff_tokens = len(eff_block_ids) * desc.block_size
+            skip_blocks = (effective_start - chunk_start) // desc.block_size
+            skip_tokens = skip_blocks * desc.block_size
+            eff_block_ids = chunk_block_ids[skip_blocks:]
+            eff_tokens = len(eff_block_ids) * desc.block_size
 
-        # H2D the effective (post-skip) tokens into a *packed* contiguous
-        # staging buffer. A sliced view ``src[:, :, skip_tokens:]`` of a
-        # ``[kv, layers, tokens, hidden]`` chunk is NOT contiguous across
-        # layers, but the kernel assumes layer ``L`` lives at
-        # ``L * eff_tokens * hidden`` from the base — so we copy the slice
-        # into a freshly sized contiguous buffer instead of passing the view.
-        src = chunks[chunk_idx]
-        src_slice = src[:, :, skip_tokens:] if skip_tokens else src
-        staging = desc.staging_for(kv_lead=2, tokens=eff_tokens)
-        staging.copy_(src_slice)
+            # H2D the effective (post-skip) tokens into a *packed* contiguous
+            # staging buffer. A sliced view ``src[:, :, skip_tokens:]`` of a
+            # ``[kv, layers, tokens, hidden]`` chunk is NOT contiguous across
+            # layers, but the kernel assumes layer ``L`` lives at
+            # ``L * eff_tokens * hidden`` from the base — so we copy the slice
+            # into a freshly sized contiguous buffer instead of passing the view.
+            src = chunks[chunk_idx]
+            src_slice = src[:, :, skip_tokens:] if skip_tokens else src
+            staging = desc.staging_for(kv_lead=2, tokens=eff_tokens)
+            staging.copy_(src_slice, non_blocking=True)
 
-        slot_mapping = _build_slot_mapping(eff_block_ids, desc.block_size, desc.device)
-        lmc_ops.multi_layer_kv_transfer(
-            key_value=staging,
-            key_value_ptrs=desc.ptr_table,
-            slot_mapping=slot_mapping,
-            paged_memory_device=desc.device,
-            page_buffer_size=desc.page_buffer_size,
-            direction=False,  # to_gpu: staging -> paged
-            use_mla=desc.use_mla,
-            kvcache_format_raw=desc.kv_format.value,
-            k_hidden_dims=k1,
-            v_hidden_dims=k2,
-            dsa_hidden_dims=k3,
-            dsa_c8_scale_plane_bytes=k4,
-            paged_kv_block_size=desc.block_size,
-        )
+            slot_mapping = _build_slot_mapping(
+                eff_block_ids, desc.block_size, desc.device
+            )
+            lmc_ops.multi_layer_kv_transfer(
+                key_value=staging,
+                key_value_ptrs=desc.ptr_table,
+                slot_mapping=slot_mapping,
+                paged_memory_device=desc.device,
+                page_buffer_size=desc.page_buffer_size,
+                direction=False,  # to_gpu: staging -> paged
+                use_mla=desc.use_mla,
+                kvcache_format_raw=desc.kv_format.value,
+                k_hidden_dims=k1,
+                v_hidden_dims=k2,
+                dsa_hidden_dims=k3,
+                dsa_c8_scale_plane_bytes=k4,
+                paged_kv_block_size=desc.block_size,
+            )
 
 
 # --- Override installation -------------------------------------------------
 
 _orig_gather: Optional[object] = None
 _orig_scatter: Optional[object] = None
+# LMC-A: originals of EngineDrivenTransferContext.submit_store / submit_retrieve,
+# saved so the NPU-aware wrappers below can fall back to them for non-NPU /
+# unsupported-layout workers.
+_orig_submit_store: Optional[object] = None
+_orig_submit_retrieve: Optional[object] = None
 
 
 def _gather_wrapper(
@@ -398,14 +461,174 @@ def _scatter_wrapper(
     )
 
 
+def _flatten_single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
+    """Flatten the single per-group block-id list for engine-driven transfer.
+
+    Mirrors upstream ``_single_group_block_ids`` (worker_transfer.py) without
+    importing that private helper. The NPU fused path, like upstream's
+    engine-driven path, handles one KV cache group only; multi-group transfers
+    are rejected here.
+    """
+    if len(block_ids) != 1:
+        raise RuntimeError(
+            "engine-driven transfer does not support hybrid KV cache groups"
+        )
+    return block_ids[0]
+
+
+def _submit_store_wrapper(
+    self,
+    _request_id: object,
+    key: object,
+    instance_id: int,
+    kv_caches: dict[str, torch.Tensor],
+    block_ids: list[list[int]],
+    _event: object,
+    blocks_in_chunk: int,
+) -> MessagingFuture:
+    """NPU-aware ``EngineDrivenTransferContext.submit_store``.
+
+    Falls back to the upstream method when ``kv_caches`` is not a supported NPU
+    layout (``_get_descriptor`` returns ``None``). Otherwise it replaces
+    upstream's whole-device pre-gather sync (worker_transfer.py:429) with a
+    non-blocking ``transfer_stream.wait_stream(torch.npu.current_stream())``
+    (mirrors the in-process connector at npu_connectors.py:1126). The passed
+    ``_event`` is intentionally unused: the deployed vLLM connector resolves the
+    "forward-completion event" to a CPU-runner ``_EventPlaceholder`` (which has
+    no ``.wait``), so ordering via the current (forward) stream is both robust
+    and exactly what the in-process path already does. The fused gather then
+    runs on the transfer stream, and the post-gather whole-device sync (:448)
+    becomes a single ``transfer_stream.synchronize()`` before commit.
+    """
+    if self._engine_driven_context is None:
+        raise RuntimeError(
+            "Engine-driven transfer context is not registered. "
+            "Call register() before submit_store()."
+        )
+    desc = _get_descriptor(kv_caches)
+    if desc is None:
+        assert _orig_submit_store is not None
+        return _orig_submit_store(  # type: ignore[misc]
+            self,
+            _request_id,
+            key,
+            instance_id,
+            kv_caches,
+            block_ids,
+            _event,
+            blocks_in_chunk,
+        )
+
+    # Order the transfer stream against the forward that wrote the paged KV
+    # (which ran on the current/compute stream), replacing the whole-device
+    # pre-gather sync (worker_transfer.py:429). The passed _event is a vLLM
+    # _EventPlaceholder and is intentionally unused here.
+    desc.transfer_stream.wait_stream(torch.npu.current_stream())
+    result = self._engine_driven_context.prepare_store(key, instance_id)
+    out_buffers, chunk_indices = result if result is not None else (None, None)
+    # All chunks already in cache — nothing to gather or commit.
+    if chunk_indices is not None and len(chunk_indices) == 0:
+        future: MessagingFuture[bool] = MessagingFuture()
+        future.set_result(True)
+        return future
+    cpu_chunks = _gather_wrapper(
+        kv_caches,
+        _flatten_single_group_block_ids(block_ids),
+        blocks_in_chunk,
+        layout_hints=self._layout_hints,
+        engine_kv_format=self._engine_kv_format,
+        out=out_buffers,
+        chunk_indices=chunk_indices,
+    )
+    # Complete the async D2H on the transfer stream before commit, replacing
+    # the whole-device sync at worker_transfer.py:448.
+    desc.transfer_stream.synchronize()
+    ok = self._engine_driven_context.commit_store(key, instance_id, cpu_chunks)
+
+    future = MessagingFuture()
+    future.set_result(ok)
+    return future
+
+
+def _submit_retrieve_wrapper(
+    self,
+    _request_id: object,
+    key: object,
+    instance_id: int,
+    kv_caches: dict[str, torch.Tensor],
+    block_ids: list[list[int]],
+    _event: object,
+    blocks_in_chunk: int,
+    skip_first_n_tokens: int = 0,
+) -> MessagingFuture:
+    """NPU-aware ``EngineDrivenTransferContext.submit_retrieve``.
+
+    Falls back to the upstream method for unsupported layouts. Otherwise it runs
+    the fused scatter on the transfer stream and replaces the whole-device
+    post-scatter sync (worker_transfer.py:490) with a single
+    ``transfer_stream.synchronize()`` before the SHM slot is released
+    (``commit_retrieve``). ``event`` is unused here, matching upstream.
+    """
+    if self._engine_driven_context is None:
+        raise RuntimeError(
+            "Engine-driven transfer context is not registered. "
+            "Call register() before submit_retrieve()."
+        )
+    desc = _get_descriptor(kv_caches)
+    if desc is None:
+        assert _orig_submit_retrieve is not None
+        return _orig_submit_retrieve(  # type: ignore[misc]
+            self,
+            _request_id,
+            key,
+            instance_id,
+            kv_caches,
+            block_ids,
+            _event,
+            blocks_in_chunk,
+            skip_first_n_tokens=skip_first_n_tokens,
+        )
+
+    src_buffers = self._engine_driven_context.prepare_retrieve(key, instance_id)
+    ok = src_buffers is not None
+    if src_buffers is not None:
+        try:
+            _scatter_wrapper(
+                kv_caches,
+                _flatten_single_group_block_ids(block_ids),
+                src_buffers,
+                blocks_in_chunk,
+                skip_first_n_tokens=skip_first_n_tokens,
+                layout_hints=self._layout_hints,
+                engine_kv_format=self._engine_kv_format,
+            )
+        except (RuntimeError, ValueError, TypeError, IndexError):
+            logger.exception("Failed to scatter retrieved CPU context chunks")
+            ok = False
+        # Ensure the scatter's device writes are complete before releasing the
+        # SHM slot, replacing the whole-device sync at worker_transfer.py:490.
+        desc.transfer_stream.synchronize()
+    self._engine_driven_context.commit_retrieve(key, instance_id)
+
+    future: MessagingFuture[bool] = MessagingFuture()
+    future.set_result(ok)
+    return future
+
+
 def install_overrides() -> None:
-    """Replace the upstream gather/scatter callables with the NPU dispatcher.
+    """Replace the upstream gather/scatter + submit callables with NPU dispatchers.
 
     Idempotent.  Patches both ``base`` (definition site) and ``worker_transfer``
-    (import binding used by ``DataTransferContext`` at call time) because the
-    upstream adapter imports the names by value.
+    (import binding used by ``DataTransferContext`` at call time) for the
+    gather/scatter names, because the upstream adapter imports them by value.
+
+    Additionally patches ``EngineDrivenTransferContext.submit_store`` /
+    ``submit_retrieve`` so the NPU path orders the fused transfer on a dedicated
+    stream via the forward-completion event instead of upstream's whole-device
+    ``torch_dev.synchronize()`` calls. Non-NPU / unsupported-layout workers fall
+    back to the saved originals unchanged.
     """
-    global _orig_gather, _orig_scatter
+    global _orig_gather, _orig_scatter, _orig_submit_store, _orig_submit_retrieve
 
     # Third Party
     import lmcache.v1.multiprocess.transfer_context.base as base
@@ -419,8 +642,19 @@ def install_overrides() -> None:
     base.scatter_cpu_to_paged_kv = _scatter_wrapper  # type: ignore[assignment]
     wt.gather_paged_kv_to_cpu = _gather_wrapper  # type: ignore[assignment]
     wt.scatter_cpu_to_paged_kv = _scatter_wrapper  # type: ignore[assignment]
+
+    if _orig_submit_store is None:
+        _orig_submit_store = wt.EngineDrivenTransferContext.submit_store
+        _orig_submit_retrieve = wt.EngineDrivenTransferContext.submit_retrieve
+    wt.EngineDrivenTransferContext.submit_store = (  # type: ignore[assignment]
+        _submit_store_wrapper
+    )
+    wt.EngineDrivenTransferContext.submit_retrieve = (  # type: ignore[assignment]
+        _submit_retrieve_wrapper
+    )
+
     logger.info(
-        "Installed NPU fused gather/scatter override for MP non-GPU transfer "
-        "(supported formats: %s)",
+        "Installed NPU fused gather/scatter + transfer-stream submit override "
+        "for MP non-GPU transfer (supported formats: %s)",
         ", ".join(f.name for f in _SUPPORTED_FORMATS),
     )
