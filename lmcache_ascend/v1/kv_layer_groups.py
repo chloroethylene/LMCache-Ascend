@@ -9,7 +9,11 @@ from typing import Any, Optional, Sequence, Union
 
 # Third Party
 from lmcache.logging import init_logger
-from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, KVLayerGroupsManager
+from lmcache.v1.kv_layer_groups import (
+    KVLayerGroupInfo,
+    KVLayerGroupsManager,
+    ObjectGroupInfo,
+)
 import torch
 
 # First Party
@@ -263,7 +267,7 @@ def build_kv_layer_groups(
     Body of ``KVLayerGroupsManager.__init__`` on the Ascend dispatch path
     (see npu_connectors early init).
     """
-    self.kv_layer_groups = []
+    self._kernel_groups = []
     self._vllm_block_size = (layout_hints or {}).get("vllm_block_size")
     self._kv_format = kv_format
     self.inference_engine_logical_block_size_: int | None = (
@@ -366,16 +370,30 @@ def build_kv_layer_groups(
             layer_indices=indices,
             shape_desc=shape_desc,
             dtype=rep_dtype,
-            compress_ratio=compress_ratio,
-            physical_chunk_size=physical_chunk_size,
         )
+        # LMC-A: upstream dropped compress_ratio/physical_chunk_size from
+        # KernelGroupInfo (PRs #3616/#3635 moved to tokens_per_block). Carry
+        # them as instance attrs -- same pattern as multi_plane_hidden_bytes
+        # below -- so downstream consumers (_derive_group_params, multi-plane
+        # row bytes) keep working unchanged.
+        group_info.compress_ratio = compress_ratio
+        group_info.physical_chunk_size = physical_chunk_size
         if multi_plane_hidden_bytes is not None:
             group_info.multi_plane_hidden_bytes = multi_plane_hidden_bytes
         kv_layer_groups.append(group_info)
 
-    self.kv_layer_groups = kv_layer_groups
+    # LMC-A: write the backing field (_kernel_groups) -- upstream made
+    # kv_layer_groups a read-only deprecated property (alias for kernel_groups),
+    # so assigning the property raises. Mirror __init__'s bookkeeping on this
+    # __new__-built manager so object_groups / _lmcache_tokens_per_chunk hold
+    # the same invariants a normally-constructed manager would.
+    self._kernel_groups = kv_layer_groups
+    self._object_groups = [
+        ObjectGroupInfo(kernel_group_indices=list(range(len(kv_layer_groups))))
+    ]
+    self._lmcache_tokens_per_chunk = lmcache_logical_chunk_size
     self.inference_engine_logical_block_size_ = (
         self.inference_engine_logical_block_size_
-        or self.kv_layer_groups[0].shape_desc.bs
+        or self._kernel_groups[0].shape_desc.bs
     )
     logger.info("KV layer groups: %s", kv_layer_groups)

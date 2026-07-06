@@ -195,6 +195,25 @@ def _first_layer_tensor(
     return first
 
 
+# LMC-A: plugin-local KV-group attributes that upstream KernelGroupInfo no longer
+# declares as fields (compress_ratio, physical_chunk_size) plus our own
+# multi_plane_hidden_bytes. dataclasses.replace() copies only declared fields, so
+# whenever we replace() a group we must re-apply these by hand or they silently
+# vanish (regressing compressed / multi-plane chunk sizing).
+_PLUGIN_GROUP_INSTANCE_ATTRS: tuple[str, ...] = (
+    "compress_ratio",
+    "physical_chunk_size",
+    "multi_plane_hidden_bytes",
+)
+
+
+def _copy_plugin_group_attrs(src: Any, dst: Any) -> None:
+    """Re-apply plugin-local instance attrs that dataclasses.replace() drops."""
+    for name in _PLUGIN_GROUP_INSTANCE_ATTRS:
+        if hasattr(src, name):
+            setattr(dst, name, getattr(src, name))
+
+
 # Stage-2 NPU grouping after upstream KVLayerGroupsManager (or build_kv_layer_groups): shape-only
 # buckets can mix flat layers that map to different vLLM scheduler groups (DSv4: ~3 shape groups
 # -> 6 NPU groups). Split so each group has one scheduler_slot_group for store/load.
@@ -213,10 +232,10 @@ def _split_kv_layer_groups_by_scheduler_slot(
     lmcache_logical_chunk_size: int = 256,
 ) -> None:
     """Subdivide upstream groups when flattened layers share a shape but not a slot group."""
-    from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
+    from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, ObjectGroupInfo
 
     split_groups: list[KVLayerGroupInfo] = []
-    for group in manager.kv_layer_groups:
+    for group in manager.kernel_groups:
         buckets: dict[int, list[int]] = defaultdict(list)
         for layer_idx in group.layer_indices:
             buckets[int(sched_map[layer_idx])].append(layer_idx)
@@ -227,13 +246,14 @@ def _split_kv_layer_groups_by_scheduler_slot(
             indices = buckets[sched_g]
             new_sd = copy.copy(group.shape_desc)
             new_sd.nl = len(indices)
-            split_groups.append(
-                dataclasses.replace(
-                    group,
-                    layer_indices=indices,
-                    shape_desc=new_sd,
-                )
+            new_g = dataclasses.replace(
+                group,
+                layer_indices=indices,
+                shape_desc=new_sd,
             )
+            # replace() drops non-field instance attrs; re-apply ours.
+            _copy_plugin_group_attrs(group, new_g)
+            split_groups.append(new_g)
             logger.debug(
                 "Split KV layer group by scheduler_slot_group=%d -> layers=%s",
                 sched_g, indices,
@@ -245,15 +265,20 @@ def _split_kv_layer_groups_by_scheduler_slot(
         for group in split_groups:
             sched_g = int(sched_map[group.layer_indices[0]])
             ratio = max(1, int(ratios[sched_g]))
-            patched.append(
-                dataclasses.replace(
-                    group,
-                    compress_ratio=ratio,
-                    physical_chunk_size=chunk // ratio,
-                )
-            )
+            new_g = dataclasses.replace(group)
+            _copy_plugin_group_attrs(group, new_g)
+            # Override with the ratio-derived sizing for this scheduler group.
+            new_g.compress_ratio = ratio
+            new_g.physical_chunk_size = chunk // ratio
+            patched.append(new_g)
         split_groups = patched
-    manager.kv_layer_groups = split_groups
+    # LMC-A: write the backing field -- upstream made kv_layer_groups a read-only
+    # property. Refresh object_groups to match the (possibly subdivided) kernel
+    # count; upstream's invariant is one object group spanning all kernel groups.
+    manager._kernel_groups = split_groups
+    manager._object_groups = [
+        ObjectGroupInfo(kernel_group_indices=list(range(len(split_groups))))
+    ]
 
 
 def _materialize_mp_device_params(
@@ -1276,7 +1301,9 @@ class VLLMPagedMemNPUConnectorV2(_V2KVTransferMixin, VLLMPagedMemGPUConnectorV2)
             return
 
         # Third Party
-        from lmcache.v1.gpu_connector.utils import normalize_kv_and_discover_format
+        from lmcache.v1.gpu_connector.utils import (
+            normalize_and_discover_per_layer_formats,
+        )
         from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
         from lmcache.utils import EngineType
 
@@ -1307,17 +1334,25 @@ class VLLMPagedMemNPUConnectorV2(_V2KVTransferMixin, VLLMPagedMemGPUConnectorV2)
             )
             self.metadata.kv_layer_groups_manager = mgr
         else:
-            gpu_kv_format, normalized = normalize_kv_and_discover_format(
+            # LMC-A: upstream's manager now takes one EngineKVFormat *per layer*
+            # (``engine_kv_formats``, plural) plus optional ``engine_group_infos``
+            # -- the old singular ``engine_kv_format`` + ``num_blocks`` kwargs
+            # were dropped (PR #3598/#3616). Standard single-spec SEPARATE_KV is
+            # non-hybrid, so discover per-layer formats with empty engine groups
+            # (mirrors upstream VLLMPagedMemGPUConnectorV3) and pass no
+            # ``engine_group_infos``; the manager derives num_blocks from
+            # ``shape_desc.nb`` itself. The free-form ``hints`` dict is still
+            # consumed by the post-build scheduler split below.
+            normalized, engine_kv_formats = normalize_and_discover_per_layer_formats(
                 kv_caches,
-                serving_engine=EngineType.VLLM,
+                [],
+                EngineType.VLLM,
                 layout_hints=hints,
             )
             self.metadata.kv_layer_groups_manager = KVLayerGroupsManager(
                 normalized,
-                gpu_kv_format=gpu_kv_format,
-                num_blocks=num_blocks,
-                layout_hints=hints,
-                lmcache_logical_chunk_size=self.metadata.chunk_size,
+                engine_kv_formats=engine_kv_formats,
+                lmcache_tokens_per_chunk=self.metadata.chunk_size,
             )
         sched_map = hints.get("scheduler_group_by_flat_layer")
         if sched_map is not None:
@@ -1333,9 +1368,9 @@ class VLLMPagedMemNPUConnectorV2(_V2KVTransferMixin, VLLMPagedMemGPUConnectorV2)
         if (
             self.metadata is not None
             and self.metadata.kv_layer_groups_manager is not None
-            and self.metadata.kv_layer_groups_manager.kv_layer_groups
+            and self.metadata.kv_layer_groups_manager.kernel_groups
         ):
-            sd = self.metadata.kv_layer_groups_manager.kv_layer_groups[0].shape_desc
+            sd = self.metadata.kv_layer_groups_manager.kernel_groups[0].shape_desc
             if getattr(sd, "block_stride_elems", 0) > 0:
                 self._logical_page_slots = int(sd.nb) * int(sd.bs)
 
@@ -1371,14 +1406,14 @@ class VLLMPagedMemNPUConnectorV2(_V2KVTransferMixin, VLLMPagedMemGPUConnectorV2)
             if self.metadata is not None
             else None
         )
-        if klg_manager is None or not klg_manager.kv_layer_groups:
+        if klg_manager is None or not klg_manager.kernel_groups:
             self.group_kv_cache_pointers = None
             self.per_group_params = None
             return
 
         group_pointers: list[torch.Tensor] = []
         group_params: list[dict[str, Any]] = []
-        for group_idx, group in enumerate(klg_manager.kv_layer_groups):
+        for group_idx, group in enumerate(klg_manager.kernel_groups):
             indices = group.layer_indices
             rep = kv_caches[indices[0]]
             if not _is_kernel_compatible_entry(rep):

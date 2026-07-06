@@ -372,32 +372,34 @@ def test_block_stride_elems_inferred_from_dim0_stride():
 
 
 # --------------------------------------------------------------------------- #
-# Upstream MP path (GPUKVFormat) still works                                  #
+# Upstream MP path (EngineKVFormat) still works                               #
 # --------------------------------------------------------------------------- #
 
 
-def test_upstream_init_with_gpu_kv_format():
-    """Upstream manager accepts ``GPUKVFormat`` directly (MP / V3 path)."""
+def test_upstream_init_with_engine_kv_format():
+    """Upstream manager accepts ``EngineKVFormat`` directly (MP / V3 path)."""
     # First Party
     import lmcache.c_ops as lmc_ops
 
-    if not hasattr(lmc_ops, "GPUKVFormat"):
-        pytest.skip("upstream GPUKVFormat not available in this build")
+    if not hasattr(lmc_ops, "EngineKVFormat"):
+        pytest.skip("upstream EngineKVFormat not available in this build")
 
     # NL_X_TWO_NB_BS_NH_HS expects per-layer ``[2, NB, BS, NH, HS]``.
     tensors = [torch.empty(2, 32, 16, 8, 64, dtype=torch.float16)]
     mgr = KVLayerGroupsManager(
         tensors,
-        gpu_kv_format=lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
-        num_blocks=32,
+        engine_kv_formats=[lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS],
     )
-    assert len(mgr.kv_layer_groups) == 1
-    g = mgr.kv_layer_groups[0]
+    assert len(mgr.kernel_groups) == 1
+    g = mgr.kernel_groups[0]
     assert g.shape_desc.kv_size == 2
     assert g.shape_desc.bs == 16
     assert g.dtype == torch.float16
-    assert g.compress_ratio == 1
-    assert g.physical_chunk_size == 256
+    # No engine_group_infos passed -> uncompressed: tokens_per_block falls back
+    # to block_size, so one logical token maps to one physical slot. (Upstream
+    # dropped compress_ratio/physical_chunk_size in favor of tokens_per_block.)
+    assert g.tokens_per_block == 16
+    assert g.slots_per_block == 16
 
 
 def test_sliding_window_reduces_physical_chunk_size_and_multi_plane_row_width():

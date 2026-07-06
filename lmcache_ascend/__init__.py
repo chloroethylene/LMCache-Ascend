@@ -16,6 +16,9 @@ from lmcache_ascend import _build_info
 # is also used by the test infrastructure.
 LMCACHE_UPSTREAM_TAG = "v0.4.5"
 LMCACHE_ASCEND_PATCHED = False
+# Set once _patch_lazy_memory_allocator successfully swaps the pool to
+# alloc_pinned_ptr; the patch is exception-safe and retried after _patch_ops.
+_lazy_alloc_patched = False
 
 
 def _is_sglang_runtime():
@@ -44,6 +47,154 @@ def _patch_lmcache_global_variable():
 
     lmcache._detect_device = _detect_device
     lmcache.torch_dev, lmcache.torch_device_type = _detect_device()
+
+
+def _patch_pin_memory():
+    """Register the NPU host-memory pin backend and retrofit the live ``DeviceExt``.
+
+    Upstream's ``EngineDrivenContextShm._pin_shm_buffer`` calls
+    ``torch_dev.ext.pin_memory`` to page-lock the worker SHM pool so D2H/H2D
+    copies run async. ``DeviceExt`` is constructed at ``import lmcache`` (before
+    this plugin loads) with the no-op base backend, so -- in addition to
+    exposing the backend on ``NpuDeviceInfo.pin_memory_backend`` for any future
+    ``DeviceExt`` (see :mod:`lmcache_ascend.v1.platform`) -- we overwrite the
+    already-built instance's ``_pin`` with an :class:`NpuPinMemoryBackend`.
+    """
+    # First Party
+    from lmcache.logging import init_logger
+    from lmcache_ascend.v1.platform import NpuPinMemoryBackend  # registers 'npu'
+
+    # Third Party
+    from lmcache import torch_dev
+
+    logger = init_logger(__name__)
+    if torch_dev is not None and hasattr(torch_dev, "ext"):
+        backend = NpuPinMemoryBackend()
+        torch_dev.ext._pin = backend  # type: ignore[attr-defined]
+        logger.info(
+            "Installed NPU host pin backend (is_pin_supported=%s) on torch_dev.ext",
+            backend.is_pin_supported(),
+        )
+
+
+def _patch_lazy_memory_allocator():
+    """Back the LazyMemoryAllocator pool with aclrtMallocHost-pinned memory.
+
+    Upstream allocates the cache-server pool with ``torch.empty`` and pins each
+    chunk post-hoc via ``torch_dev.ext.pin_memory`` (``aclrtHostRegister``).
+    ``aclrtHostRegister`` is unreliable on ``torch.empty``/malloc memory at pool
+    scale (intermittent ``507899``), so the per-chunk pins fail noisily and the
+    pool stays unpinned. The compiled ascend helper ``alloc_pinned_ptr`` instead
+    does ``aclrtMallocHost`` + an internal ``register_ptr`` in C++, yielding
+    memory that is pinned and registered at allocation time (async D2H works with
+    no post-hoc register).
+
+    This replaces ``__init__`` to source the whole pool from ``alloc_pinned_ptr``
+    (NUMA binding is intentionally not applied -- the server runs without a NUMA
+    mapping), makes ``_pin_memory_chunk`` a no-op (the pool is already pinned), and
+    frees via ``free_pinned_ptr`` at close. No-op when ``alloc_pinned_ptr`` is
+    absent (non-ascend build).
+    """
+    # Applied once; idempotent and exception-safe so it can be retried after
+    # ``_patch_ops`` sets ``lmcache.c_ops`` (the early call during ``import
+    # lmcache`` hits a circular ``import lmcache.c_ops`` and is skipped).
+    global _lazy_alloc_patched
+    if _lazy_alloc_patched:
+        return
+
+    # Standard
+    import ctypes
+    import threading
+
+    # Third Party
+    import torch
+
+    # First Party
+    from lmcache.logging import init_logger
+    from lmcache import torch_dev
+
+    _logger = init_logger(__name__)
+    try:
+        from lmcache.v1.lazy_memory_allocator import (
+            AddressManager,
+            LazyMemoryAllocator,
+            TensorMemoryAllocator,
+            align_to,
+        )
+    except Exception as exc:  # circular during early activation; retry later
+        _logger.debug(
+            "LazyMemoryAllocator patch deferred (lmcache.v1 not ready yet): %r",
+            exc,
+        )
+        return
+
+    def _ascend_init(
+        self: LazyMemoryAllocator,
+        init_size: int,
+        final_size: int,
+        align_bytes: int = AddressManager.ALIGN_BYTES,
+        numa_mapping: Any = None,
+    ) -> None:
+        """Mirror upstream ``__init__`` but back the buffer with aclrtMallocHost."""
+        # Lazy import: at plugin-activation time ``lmcache.c_ops`` has not yet been
+        # swapped to the ascend backend (``_patch_ops`` runs later), so resolve the
+        # ascend extension directly here, at construction time.
+        # First Party
+        import lmcache_ascend.c_ops as ascend_c_ops
+
+        self._use_numa = False
+        self._curr_size = align_to(init_size, self.PIN_CHUNK_SIZE)
+        self._final_size = align_to(final_size, self.PIN_CHUNK_SIZE)
+        if not torch_dev.ext.is_pin_supported:
+            raise RuntimeError(
+                "Backend does not support memory pinning. "
+                "LazyMemoryAllocator requires pinned memory."
+            )
+        self._pin_record: list[tuple[int, int]] = []
+        # Ensure an ACL context on this thread: aclrtMallocHost (inside
+        # alloc_pinned_ptr) fails with 107002 if no device op has run yet, e.g.
+        # on the cache-server thread. Idempotent on workers that already have one.
+        if torch.npu.is_available():
+            torch.npu.set_device(torch.npu.current_device())
+        # Whole pool from aclrtMallocHost: pinned + registered at allocation time,
+        # so no per-chunk aclrtHostRegister is needed (or reliable).
+        ptr = ascend_c_ops.alloc_pinned_ptr(self._final_size, 0)
+        arr_type = ctypes.c_uint8 * self._final_size
+        self._buffer = torch.frombuffer(arr_type.from_address(ptr), dtype=torch.uint8)
+        self._ascend_pool_ptr: int = ptr
+        self._allocator = TensorMemoryAllocator(
+            tensor=self._buffer,
+            align_bytes=align_bytes,
+            init_address_space=self._curr_size,
+        )
+        self._address_manager = self._allocator.address_manager
+        self._stop_expand = threading.Event()
+        self._expand_thread = threading.Thread(
+            target=self._expand_worker, daemon=True, name="lazy-mem-expand-thread"
+        )
+        self._expand_thread.start()
+
+    def _ascend_pin_memory_chunk(self, offset: int, size: int) -> None:
+        """No-op: the pool is already pinned by ``alloc_pinned_ptr``."""
+        return
+
+    def _ascend_close(self: LazyMemoryAllocator) -> None:
+        """Stop the expand thread and release the aclrtMallocHost allocation."""
+        # First Party
+        import lmcache_ascend.c_ops as ascend_c_ops
+
+        self._stop_expand.set()
+        self._expand_thread.join()
+        # Releases the internal register_ptr + the aclrtMallocHost allocation.
+        ascend_c_ops.free_pinned_ptr(self._ascend_pool_ptr)
+
+    LazyMemoryAllocator.__init__ = _ascend_init  # type: ignore[assignment]
+    LazyMemoryAllocator._pin_memory_chunk = _ascend_pin_memory_chunk  # type: ignore[assignment]
+    LazyMemoryAllocator.close = _ascend_close  # type: ignore[assignment]
+    _lazy_alloc_patched = True
+    _logger.info(
+        "Routed LazyMemoryAllocator pool through alloc_pinned_ptr (aclrtMallocHost)"
+    )
 
 
 def _patch_config():
@@ -286,6 +437,16 @@ def _patch_ops():
     # First Party
     import lmcache_ascend.c_ops as ascend_c_ops
 
+    # Merge fallback functions that ascend c_ops doesn't implement
+    # (e.g., alloc_shm_pinned_ptr, free_shm_pinned_ptr, hugepage
+    # functions).  This must happen BEFORE any downstream module
+    # imports lmcache.c_ops, otherwise the bound reference will miss
+    # these symbols.
+    from lmcache import python_ops_fallback
+    for attr_name in dir(python_ops_fallback):
+        if not attr_name.startswith("__") and not hasattr(ascend_c_ops, attr_name):
+            setattr(ascend_c_ops, attr_name, getattr(python_ops_fallback, attr_name))
+
     # LMCache v0.4.2 introduces GPUKVFormat enum in c_ops (CUDA pybind).
     # Ascend c_ops doesn't have it, so we provide a compatible mock
     # to avoid AttributeError when upstream code references it.
@@ -311,7 +472,7 @@ def _patch_ops():
     # Python equivalent (same __slots__) for Ascend.
     if not hasattr(ascend_c_ops, "PageBufferShapeDesc"):
         # Third Party
-        from lmcache.non_cuda_equivalents import PageBufferShapeDesc
+        from lmcache.python_ops_fallback import PageBufferShapeDesc
 
         ascend_c_ops.PageBufferShapeDesc = PageBufferShapeDesc
 
@@ -459,6 +620,110 @@ def _patch_multi_process():
     lm_mp_types.CudaIPCWrapper = AscendIPCWrapper
 
 
+def _patch_mp_transfer_context():
+    """Route MP non-GPU gather/scatter through the fused NPU transfer kernel.
+
+    Replaces ``gather_paged_kv_to_cpu`` / ``scatter_cpu_to_paged_kv`` (on both
+    the ``base`` and ``worker_transfer`` namespaces) with dispatchers that use
+    ``fused_multi_layer_kv_transfer`` for SEPARATE_KV caches on 910B/C NPU,
+    falling back to the upstream PyTorch path otherwise. See
+    :mod:`lmcache_ascend.v1.multiprocess.npu_gather` for scope and limits.
+    """
+    # First Party
+    from lmcache_ascend.v1.multiprocess.npu_gather import install_overrides
+
+    install_overrides()
+
+
+# Set once _patch_mp_server_shm_default has wrapped the server SHM default.
+_mp_server_shm_default_patched = False
+
+
+def _patch_mp_server_shm_default():
+    """Default the Ascend MP server to zero-copy SHM transport.
+
+    Without this, ``lmcache server`` runs in **pickle** mode: ``use_lazy``
+    defaults to True, and ``MPCacheServerContext._compute_shm_pool_info``
+    disables engine-driven SHM whenever ``use_lazy`` is set -- so the worker
+    pickles every KV tensor and ships it over ZMQ, which is ~96x slower for
+    Ascend MP transfers (TTFT 61 s vs 0.64 s with SHM). Pickle has no realistic
+    use case on Ascend MP, so default to non-lazy named-SHM L1 instead.
+
+    The default is applied inside ``_compute_shm_pool_info`` (wrapped below),
+    which runs before ``StorageManager`` init in ``MPCacheServerContext.__init``
+    -- so flipping ``use_lazy=False`` correctly selects the non-lazy
+    ``MixedMemoryAllocator`` backed by the named POSIX SHM region. Workers then
+    attach that region by name (``EngineDrivenContextShm``) and pin it; no
+    worker-side change is needed.
+
+    Falls back to pickle with a warning if ``/dev/shm`` is too small for L1.
+    Set ``LMCACHE_ASCEND_MP_SHM=0`` to disable the auto-default (byte-identical
+    to upstream). Server-only: workers never instantiate
+    ``MPCacheServerContext``, so this patch does not affect them.
+    """
+    global _mp_server_shm_default_patched
+    if _mp_server_shm_default_patched:
+        return
+
+    # Standard
+    import os
+    import shutil
+
+    # Third Party
+    from lmcache.logging import init_logger
+
+    # First Party
+    from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
+
+    logger = init_logger(__name__)
+
+    if os.environ.get("LMCACHE_ASCEND_MP_SHM", "1").lower() in ("0", "false", "no"):
+        logger.info(
+            "LMCACHE_ASCEND_MP_SHM=0: keeping upstream pickle default for the "
+            "MP server (zero-copy SHM disabled)"
+        )
+        _mp_server_shm_default_patched = True
+        return
+
+    _orig_compute_shm_pool_info = MPCacheServerContext._compute_shm_pool_info
+
+    def _ascend_compute_shm_pool_info(storage_manager_config):
+        mem_cfg = storage_manager_config.l1_manager_config.memory_config
+        # Default a named SHM pool when the operator did not configure one.
+        if not mem_cfg.shm_name and sys.platform.startswith("linux"):
+            try:
+                free_bytes = shutil.disk_usage("/dev/shm").free
+            except OSError:
+                free_bytes = 0
+            if free_bytes < mem_cfg.size_in_bytes:
+                logger.warning(
+                    "Ascend MP: /dev/shm has only %d bytes free but L1 needs "
+                    "%d; falling back to pickle transport. Enlarge /dev/shm "
+                    "(or reduce --l1-size-gb) for zero-copy SHM.",
+                    free_bytes,
+                    mem_cfg.size_in_bytes,
+                )
+                return _orig_compute_shm_pool_info(storage_manager_config)
+            mem_cfg.shm_name = "lmcache_ascend_mp"
+        # Named SHM requires the non-lazy MixedMemoryAllocator: the lazy
+        # allocator uses aclrtMallocHost, which is not a named POSIX SHM
+        # region and therefore cannot be shared with workers by name.
+        if mem_cfg.use_lazy:
+            mem_cfg.use_lazy = False
+            logger.info(
+                "Ascend MP: defaulting L1 to non-lazy named SHM "
+                "(shm_name=%s, use_lazy=False) for zero-copy transfer; "
+                "workers will pin the pool on startup (one-time cost).",
+                mem_cfg.shm_name,
+            )
+        return _orig_compute_shm_pool_info(storage_manager_config)
+
+    MPCacheServerContext._compute_shm_pool_info = staticmethod(  # type: ignore[assignment]
+        _ascend_compute_shm_pool_info
+    )
+    _mp_server_shm_default_patched = True
+
+
 def _patch_gpu_connector():
     """Patch CreateGPUConnector to return NPU connectors on Ascend.
 
@@ -557,9 +822,9 @@ def _patch_metadata_get_shapes():
         if num_tokens is None:
             num_tokens = self.chunk_size
         klg_manager = self.kv_layer_groups_manager
-        if klg_manager is not None and klg_manager.kv_layer_groups:
+        if klg_manager is not None and klg_manager.kernel_groups:
             shapes: list[torch.Size] = []
-            for group in klg_manager.kv_layer_groups:
+            for group in klg_manager.kernel_groups:
                 hidden = group.hidden_dim_size
                 plane_bytes = getattr(group, "multi_plane_hidden_bytes", None)
                 if plane_bytes is not None:
@@ -744,6 +1009,8 @@ if not LMCACHE_ASCEND_PATCHED:
 
     if _build_info.__framework_name__ == "pytorch":
         _patch_lmcache_global_variable()
+        _patch_pin_memory()
+        _patch_lazy_memory_allocator()
 
     _patch_config()
 
@@ -759,6 +1026,9 @@ if not LMCACHE_ASCEND_PATCHED:
         _patch_torch_capability()
 
     _patch_ops()
+    # Retry now that _patch_ops has set lmcache.c_ops (the early call during
+    # import lmcache hits a circular import lmcache.c_ops and is skipped).
+    _patch_lazy_memory_allocator()
     if is_vllm:
         _patch_gpu_connector()
 
@@ -774,6 +1044,8 @@ if not LMCACHE_ASCEND_PATCHED:
         _patch_transfer_channel()
         _patch_cacheblend()
         _patch_multi_process()
+        _patch_mp_transfer_context()
+        _patch_mp_server_shm_default()
         _patch_lookup_client()
         _patch_cache_controller_worker()
         _patch_rpc_utils()
