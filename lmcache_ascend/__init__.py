@@ -49,34 +49,6 @@ def _patch_lmcache_global_variable():
     lmcache.torch_dev, lmcache.torch_device_type = _detect_device()
 
 
-def _patch_pin_memory():
-    """Register the NPU host-memory pin backend and retrofit the live ``DeviceExt``.
-
-    Upstream's ``EngineDrivenContextShm._pin_shm_buffer`` calls
-    ``torch_dev.ext.pin_memory`` to page-lock the worker SHM pool so D2H/H2D
-    copies run async. ``DeviceExt`` is constructed at ``import lmcache`` (before
-    this plugin loads) with the no-op base backend, so -- in addition to
-    exposing the backend on ``NpuDeviceInfo.pin_memory_backend`` for any future
-    ``DeviceExt`` (see :mod:`lmcache_ascend.v1.platform`) -- we overwrite the
-    already-built instance's ``_pin`` with an :class:`NpuPinMemoryBackend`.
-    """
-    # First Party
-    from lmcache.logging import init_logger
-    from lmcache_ascend.v1.platform import NpuPinMemoryBackend  # registers 'npu'
-
-    # Third Party
-    from lmcache import torch_dev
-
-    logger = init_logger(__name__)
-    if torch_dev is not None and hasattr(torch_dev, "ext"):
-        backend = NpuPinMemoryBackend()
-        torch_dev.ext._pin = backend  # type: ignore[attr-defined]
-        logger.info(
-            "Installed NPU host pin backend (is_pin_supported=%s) on torch_dev.ext",
-            backend.is_pin_supported(),
-        )
-
-
 def _patch_lazy_memory_allocator():
     """Back the LazyMemoryAllocator pool with aclrtMallocHost-pinned memory.
 
@@ -1009,7 +981,6 @@ if not LMCACHE_ASCEND_PATCHED:
 
     if _build_info.__framework_name__ == "pytorch":
         _patch_lmcache_global_variable()
-        _patch_pin_memory()
         _patch_lazy_memory_allocator()
 
     _patch_config()

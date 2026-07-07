@@ -23,7 +23,7 @@ buffer must stay contiguous and exactly token-sized because the kernel indexes
 it by raw pointer arithmetic.
 
 When the worker SHM pool is page-locked -- which it is once the
-:class:`~lmcache_ascend.v1.platform.npu_pin_memory.NpuPinMemoryBackend` is
+:class:`~lmcache.v1.platform.npu.pin_memory.NpuPinMemoryBackend` is
 active (AscendCL ``aclrtHostRegister``) -- the per-chunk ``copy_(non_blocking)``
 is genuinely async, so a whole sub-batch is one device kernel plus N pipelined
 async copies awaited by a single stream sync. Without pinning torch falls back
