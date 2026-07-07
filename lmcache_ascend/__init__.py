@@ -607,95 +607,6 @@ def _patch_mp_transfer_context():
     install_overrides()
 
 
-# Set once _patch_mp_server_shm_default has wrapped the server SHM default.
-_mp_server_shm_default_patched = False
-
-
-def _patch_mp_server_shm_default():
-    """Default the Ascend MP server to zero-copy SHM transport.
-
-    Without this, ``lmcache server`` runs in **pickle** mode: ``use_lazy``
-    defaults to True, and ``MPCacheServerContext._compute_shm_pool_info``
-    disables engine-driven SHM whenever ``use_lazy`` is set -- so the worker
-    pickles every KV tensor and ships it over ZMQ, which is ~96x slower for
-    Ascend MP transfers (TTFT 61 s vs 0.64 s with SHM). Pickle has no realistic
-    use case on Ascend MP, so default to non-lazy named-SHM L1 instead.
-
-    The default is applied inside ``_compute_shm_pool_info`` (wrapped below),
-    which runs before ``StorageManager`` init in ``MPCacheServerContext.__init``
-    -- so flipping ``use_lazy=False`` correctly selects the non-lazy
-    ``MixedMemoryAllocator`` backed by the named POSIX SHM region. Workers then
-    attach that region by name (``EngineDrivenContextShm``) and pin it; no
-    worker-side change is needed.
-
-    Falls back to pickle with a warning if ``/dev/shm`` is too small for L1.
-    Set ``LMCACHE_ASCEND_MP_SHM=0`` to disable the auto-default (byte-identical
-    to upstream). Server-only: workers never instantiate
-    ``MPCacheServerContext``, so this patch does not affect them.
-    """
-    global _mp_server_shm_default_patched
-    if _mp_server_shm_default_patched:
-        return
-
-    # Standard
-    import os
-    import shutil
-
-    # Third Party
-    from lmcache.logging import init_logger
-
-    # First Party
-    from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
-
-    logger = init_logger(__name__)
-
-    if os.environ.get("LMCACHE_ASCEND_MP_SHM", "1").lower() in ("0", "false", "no"):
-        logger.info(
-            "LMCACHE_ASCEND_MP_SHM=0: keeping upstream pickle default for the "
-            "MP server (zero-copy SHM disabled)"
-        )
-        _mp_server_shm_default_patched = True
-        return
-
-    _orig_compute_shm_pool_info = MPCacheServerContext._compute_shm_pool_info
-
-    def _ascend_compute_shm_pool_info(storage_manager_config):
-        mem_cfg = storage_manager_config.l1_manager_config.memory_config
-        # Default a named SHM pool when the operator did not configure one.
-        if not mem_cfg.shm_name and sys.platform.startswith("linux"):
-            try:
-                free_bytes = shutil.disk_usage("/dev/shm").free
-            except OSError:
-                free_bytes = 0
-            if free_bytes < mem_cfg.size_in_bytes:
-                logger.warning(
-                    "Ascend MP: /dev/shm has only %d bytes free but L1 needs "
-                    "%d; falling back to pickle transport. Enlarge /dev/shm "
-                    "(or reduce --l1-size-gb) for zero-copy SHM.",
-                    free_bytes,
-                    mem_cfg.size_in_bytes,
-                )
-                return _orig_compute_shm_pool_info(storage_manager_config)
-            mem_cfg.shm_name = "lmcache_ascend_mp"
-        # Named SHM requires the non-lazy MixedMemoryAllocator: the lazy
-        # allocator uses aclrtMallocHost, which is not a named POSIX SHM
-        # region and therefore cannot be shared with workers by name.
-        if mem_cfg.use_lazy:
-            mem_cfg.use_lazy = False
-            logger.info(
-                "Ascend MP: defaulting L1 to non-lazy named SHM "
-                "(shm_name=%s, use_lazy=False) for zero-copy transfer; "
-                "workers will pin the pool on startup (one-time cost).",
-                mem_cfg.shm_name,
-            )
-        return _orig_compute_shm_pool_info(storage_manager_config)
-
-    MPCacheServerContext._compute_shm_pool_info = staticmethod(  # type: ignore[assignment]
-        _ascend_compute_shm_pool_info
-    )
-    _mp_server_shm_default_patched = True
-
-
 def _patch_gpu_connector():
     """Patch CreateGPUConnector to return NPU connectors on Ascend.
 
@@ -1016,7 +927,6 @@ if not LMCACHE_ASCEND_PATCHED:
         _patch_cacheblend()
         _patch_multi_process()
         _patch_mp_transfer_context()
-        _patch_mp_server_shm_default()
         _patch_lookup_client()
         _patch_cache_controller_worker()
         _patch_rpc_utils()
