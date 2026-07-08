@@ -15,7 +15,10 @@ from lmcache.v1.gpu_connector.gpu_connectors import (
     VLLMPagedMemGPUConnectorV2,
     VLLMPagedMemLayerwiseGPUConnector,
 )
-from lmcache.v1.gpu_connector.utils import LayoutHints, normalize_kv_and_discover_format
+from lmcache.v1.gpu_connector.utils import (
+    LayoutHints,
+    normalize_and_discover_per_layer_formats,
+)
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.memory_management import GPUMemoryAllocator, MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
@@ -908,17 +911,25 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             )
             self.metadata.kv_layer_groups_manager = mgr
         else:
-            gpu_kv_format, normalized = normalize_kv_and_discover_format(
+            # LMC-A: upstream's manager now takes one EngineKVFormat *per layer*
+            # (``engine_kv_formats``, plural) plus optional ``engine_group_infos``
+            # -- the old singular ``engine_kv_format`` + ``num_blocks`` kwargs
+            # were dropped (PR #3598/#3616). Standard single-spec SEPARATE_KV is
+            # non-hybrid, so discover per-layer formats with empty engine groups
+            # (mirrors upstream VLLMPagedMemGPUConnectorV3) and pass no
+            # ``engine_group_infos``; the manager derives num_blocks from
+            # ``shape_desc.nb`` itself. The free-form ``hints`` dict is still
+            # consumed by the post-build scheduler split below.
+            normalized, engine_kv_formats = normalize_and_discover_per_layer_formats(
                 kv_caches,
-                serving_engine=EngineType.VLLM,
+                [],
+                EngineType.VLLM,
                 layout_hints=hints,
             )
             self.metadata.kv_layer_groups_manager = KVLayerGroupsManager(
                 normalized,
-                gpu_kv_format=gpu_kv_format,
-                num_blocks=num_blocks,
-                layout_hints=hints,
-                lmcache_logical_chunk_size=self.metadata.chunk_size,
+                engine_kv_formats=engine_kv_formats,
+                lmcache_tokens_per_chunk=self.metadata.chunk_size,
             )
         self._sync_logical_page_slots_from_manager()
 
@@ -927,9 +938,9 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         if (
             self.metadata is not None
             and self.metadata.kv_layer_groups_manager is not None
-            and self.metadata.kv_layer_groups_manager.kv_layer_groups
+            and self.metadata.kv_layer_groups_manager.kernel_groups
         ):
-            sd = self.metadata.kv_layer_groups_manager.kv_layer_groups[0].shape_desc
+            sd = self.metadata.kv_layer_groups_manager.kernel_groups[0].shape_desc
             if getattr(sd, "block_stride_elems", 0) > 0:
                 self._logical_page_slots = int(sd.nb) * int(sd.bs)
 
@@ -1057,14 +1068,14 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         klg_manager = (
             self.metadata.kv_layer_groups_manager if self.metadata is not None else None
         )
-        if klg_manager is None or not klg_manager.kv_layer_groups:
+        if klg_manager is None or not klg_manager.kernel_groups:
             self.group_kv_cache_pointers = None
             self.per_group_params = None
             return
 
         group_pointers: list[torch.Tensor] = []
         group_params: list[dict[str, Any]] = []
-        for group_idx, group in enumerate(klg_manager.kv_layer_groups):
+        for group_idx, group in enumerate(klg_manager.kernel_groups):
             # ``build_kv_layer_groups`` buckets layers by layout identity
             # (kv_size, hidden, block_size, dtype, tensor count). Every member
             # of ``indices`` shares that key and ``group.shape_desc``, so format
