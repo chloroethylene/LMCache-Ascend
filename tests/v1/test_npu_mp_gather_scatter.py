@@ -8,8 +8,6 @@ and are skipped otherwise.
 """
 
 # Standard
-import sys
-import types
 
 # Third Party
 import pytest
@@ -145,121 +143,6 @@ def test_derive_plane_geometry_rejects_unsupported():
         npu_gather._derive_plane_geometry(
             KVCacheFormat.MERGED_KV, (torch.empty(1),)
         )
-
-
-# ---------------------------------------------------------------------------
-# MLA / DSA layout-negotiation patch (no NPU required)
-# ---------------------------------------------------------------------------
-
-# Sentinel the wrapper must propagate as the MLA format flag.
-_MLA_FORMAT_FLAG = "MLA_FLAG"
-
-
-def _install_fake_c_ops(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Inject a fake ``lmcache_ascend.c_ops`` so the wrapper can resolve the
-    MLA format flag without the compiled extension.
-
-    ``import lmcache_ascend.c_ops as lmc_ops`` binds the *attribute*
-    ``lmcache_ascend.c_ops`` (not just the ``sys.modules`` entry), so both must
-    point at the fake for the override to take effect.
-    """
-    # First Party
-    import lmcache_ascend
-
-    fake = types.ModuleType("lmcache_ascend.c_ops")
-
-    class _EngineKVFormat:
-        NL_X_NB_BS_HS = _MLA_FORMAT_FLAG
-
-    fake.EngineKVFormat = _EngineKVFormat
-    monkeypatch.setattr(lmcache_ascend, "c_ops", fake)
-    monkeypatch.setitem(sys.modules, "lmcache_ascend.c_ops", fake)
-
-
-class _FakeDesc:
-    def __init__(self, kv_format: KVCacheFormat, hidden: int) -> None:
-        self.kv_format = kv_format
-        self.hidden = hidden
-
-
-def test_compute_kv_layout_wrapper_passthrough_when_desc_none(monkeypatch):
-    """No descriptor (CPU / CUDA / unsupported) -> original layout untouched."""
-    original = (2, 3, 64, "bfloat16", "TWO_X_FMT")
-    monkeypatch.setattr(
-        npu_gather, "_orig_compute_kv_layout", lambda kv, layout_hints=None: original
-    )
-    monkeypatch.setattr(npu_gather, "_get_descriptor", lambda kv: None)
-    kv = {"l0": (torch.empty(4, 2, 2, 8), torch.empty(4, 2, 2, 8))}
-    assert npu_gather._compute_kv_layout_wrapper(kv) == original
-
-
-def test_compute_kv_layout_wrapper_passthrough_for_separate_kv(monkeypatch):
-    """SEPARATE_KV descriptor must NOT be rewritten (the kernel reads size(-1))."""
-    original = (2, 3, 64, "bfloat16", "TWO_X_FMT")
-    monkeypatch.setattr(
-        npu_gather, "_orig_compute_kv_layout", lambda kv, layout_hints=None: original
-    )
-    monkeypatch.setattr(
-        npu_gather,
-        "_get_descriptor",
-        lambda kv: _FakeDesc(KVCacheFormat.SEPARATE_KV, 64),
-    )
-    kv = {"l0": (torch.empty(4, 2, 2, 8), torch.empty(4, 2, 2, 8))}
-    assert npu_gather._compute_kv_layout_wrapper(kv) == original
-
-
-def test_compute_kv_layout_wrapper_mla_overrides_hidden_and_flag(monkeypatch):
-    """MLA: report summed hidden dim + MLA format flag -> server rank-3 shape."""
-    # Upstream would wrongly report num_kv_heads*kv_lora_rank = 512 here.
-    original = (2, 3, 512, "bfloat16", "TWO_X_FMT")
-    monkeypatch.setattr(
-        npu_gather, "_orig_compute_kv_layout", lambda kv, layout_hints=None: original
-    )
-    monkeypatch.setattr(
-        npu_gather, "_get_descriptor", lambda kv: _FakeDesc(KVCacheFormat.MLA_KV, 576)
-    )
-    _install_fake_c_ops(monkeypatch)
-    kv = {"l0": (torch.empty(4, 2, 1, 512), torch.empty(4, 2, 1, 64))}
-    out = npu_gather._compute_kv_layout_wrapper(kv)
-    # hidden_dim_size corrected to kv_lora_rank + qk_rope_head_dim; format flag
-    # switched so is_mla() routes the server to the rank-3 MLA branch.
-    assert out == (2, 3, 576, "bfloat16", _MLA_FORMAT_FLAG)
-
-
-def test_compute_kv_layout_wrapper_dsa_overrides_hidden_and_flag(monkeypatch):
-    """DSA: hidden includes the dsa plane too."""
-    original = (2, 3, 512, "bfloat16", "TWO_X_FMT")
-    monkeypatch.setattr(
-        npu_gather, "_orig_compute_kv_layout", lambda kv, layout_hints=None: original
-    )
-    monkeypatch.setattr(
-        npu_gather, "_get_descriptor", lambda kv: _FakeDesc(KVCacheFormat.DSA_KV, 704)
-    )
-    _install_fake_c_ops(monkeypatch)
-    kv = {
-        "l0": (
-            torch.empty(4, 2, 1, 512),
-            torch.empty(4, 2, 1, 64),
-            torch.empty(4, 2, 1, 128),
-        )
-    }
-    out = npu_gather._compute_kv_layout_wrapper(kv)
-    assert out == (2, 3, 704, "bfloat16", _MLA_FORMAT_FLAG)
-
-
-def test_compute_kv_layout_wrapper_passes_layout_hints(monkeypatch):
-    """layout_hints must flow through to the original unchanged."""
-    captured: dict[str, object] = {}
-
-    def fake_orig(kv, layout_hints=None):
-        captured["layout_hints"] = layout_hints
-        return (2, 3, 64, "bfloat16", "FMT")
-
-    monkeypatch.setattr(npu_gather, "_orig_compute_kv_layout", fake_orig)
-    monkeypatch.setattr(npu_gather, "_get_descriptor", lambda kv: None)
-    hints = object()
-    npu_gather._compute_kv_layout_wrapper({"l0": (torch.empty(1),)}, layout_hints=hints)
-    assert captured["layout_hints"] is hints
 
 
 # ---------------------------------------------------------------------------
@@ -811,35 +694,6 @@ def test_scatter_gather_roundtrip_dsa():
             torch.testing.assert_close(kt[block].cpu(), kb[block].cpu())
             torch.testing.assert_close(vt[block].cpu(), vb[block].cpu())
             torch.testing.assert_close(dt[block].cpu(), db[block].cpu())
-
-
-@requires_npu
-def test_compute_kv_layout_wrapper_mla_negotiates_rank3_shape():
-    """End-to-end: the patched compute_kv_layout reports the MLA rank-3 shape.
-
-    With the override installed, register()'s ``is_mla`` branch must see an MLA
-    format and a hidden dim of kv_lora_rank + qk_rope_head_dim (not the upstream
-    K-plane product), so the SHM server allocates [L, tokens, k+v].
-    """
-    # First Party
-    import lmcache.v1.gpu_connector.utils as gpu_utils
-
-    npu_gather.install_overrides()
-    kv = _make_mla_kv(
-        _NUM_LAYERS,
-        _NUM_BLOCKS,
-        _BLOCK_SIZE,
-        _MLA_KV_LORA_RANK,
-        _MLA_QK_ROPE_HEAD_DIM,
-        "npu",
-    )
-    block_size, num_layers, hidden, dtype_str, fmt = (
-        npu_gather._compute_kv_layout_wrapper(kv)
-    )
-    assert block_size == _BLOCK_SIZE
-    assert num_layers == _NUM_LAYERS
-    assert hidden == _MLA_KV_LORA_RANK + _MLA_QK_ROPE_HEAD_DIM
-    assert gpu_utils.is_mla(fmt) is True
 
 
 @requires_npu

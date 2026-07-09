@@ -36,15 +36,14 @@ For MLA_KV / DSA_KV the fused kernel reuses the in-process connector's plane
 layout (``npu_connectors.py`` ``_V2KVTransferMixin``): the per-plane widths
 differ (``kv_lora_rank`` vs ``qk_rope_head_dim`` vs ``dsa_head_dim``), so the
 planes are concatenated into one flat staging block ``[1, L, tokens, sum]``
-rather than two equal slots. The SHM server, however, allocates chunk buffers
-from a single upstream-negotiated ``hidden_dim_size`` + ``use_mla`` flag, and
-``compute_kv_layout`` reports the K-plane product
-``num_kv_heads * kv_lora_rank`` for Ascend ``(K, V)`` tuples — wrong in both
-the leading and trailing dims. ``compute_kv_layout`` is therefore patched (see
-:func:`_compute_kv_layout_wrapper`) so the server allocates the rank-3
-``[num_layers, tokens, kv_lora_rank+qk_rope_head_dim(+dsa)]`` buffer the kernel
-consumes; the gather/scatter then zero-copy ``view_as`` it to the kernel's
-``[1, ...]`` staging shape. DSA_C8_KV / MULTI_PLANE_KV need a separate
+rather than two equal slots. Both MLA (the ``(latent, rope)`` 2-tuple) and DSA
+(the ``(latent, rope, dsa)`` 3-tuple) are now detected natively by LMCache core
+as ``NL_X_TWO_X_NB_BS_HS`` (see ``lmcache/v1/gpu_connector/kv_format``):
+``compute_kv_layout`` reports the summed hidden dim and an MLA flag with no
+patch here, so the SHM server allocates the rank-3
+``[num_layers, tokens, kv_lora_rank+qk_rope_head_dim(+dsa_head_dim)]`` buffer
+the kernel consumes; the gather/scatter then zero-copy ``view_as`` it to the
+kernel's ``[1, ...]`` staging shape. DSA_C8_KV / MULTI_PLANE_KV need a separate
 multi-plane kernel and remain unsupported here.
 
 In addition, ``EngineDrivenTransferContext.submit_store`` / ``submit_retrieve``
@@ -68,7 +67,7 @@ built extension — this keeps the slot-mapping and fallback logic unit-testable
 
 # Standard
 from collections.abc import Sequence
-from typing import Any, NamedTuple, Optional
+from typing import NamedTuple, Optional
 
 # Third Party
 from lmcache.logging import init_logger
@@ -633,10 +632,6 @@ _orig_scatter: Optional[object] = None
 # unsupported-layout workers.
 _orig_submit_store: Optional[object] = None
 _orig_submit_retrieve: Optional[object] = None
-# LMC-A: original of compute_kv_layout, saved so the NPU-aware wrapper below
-# can correct the Ascend MLA/DSA chunk-shape contract and pass every other case
-# through unchanged.
-_orig_compute_kv_layout: Optional[object] = None
 
 
 def _gather_wrapper(
@@ -848,52 +843,6 @@ def _submit_retrieve_wrapper(
     return future
 
 
-def _compute_kv_layout_wrapper(
-    kv_caches: dict[str, object],
-    layout_hints: Optional[object] = None,
-) -> "tuple[int, int, int, str, Any]":
-    """NPU-aware ``compute_kv_layout`` for the engine-driven SHM shape contract.
-
-    Upstream reports ``num_kv_heads * kv_lora_rank`` (the K-plane product) as
-    the chunk hidden dim for Ascend ``(K, V)`` tuples, and a non-MLA format, so
-    the SHM server would allocate ``[2, L, tokens, num_kv_heads*kv_lora_rank]``
-    — wrong for the fused MLA/DSA kernel, which needs the planes concatenated
-    as ``[num_layers, tokens, kv_lora_rank+qk_rope_head_dim(+dsa)]``. For a
-    supported NPU MLA/DSA layout this returns the summed hidden dim (from the
-    descriptor, the single source of truth) and an MLA format flag
-    (``NL_X_NB_BS_HS``, the value :func:`is_mla` accepts) so the server's
-    ``use_mla`` branch allocates the matching rank-3 buffer; the gather/scatter
-    then ``view_as`` it to the kernel's ``[1, ...]`` staging shape. Every other
-    case (SEPARATE_KV, CPU, CUDA, unsupported) is passed through unchanged.
-
-    The format flag is a signalling mechanism for the server's shape branch
-    only — the actual kernel call is driven by the descriptor's real Ascend
-    ``KVCacheFormat`` (MLA_KV/DSA_KV), so the stored ``_engine_kv_format`` is
-    never used to interpret Ascend tensors.
-    """
-    assert _orig_compute_kv_layout is not None
-    result = _orig_compute_kv_layout(  # type: ignore[misc]
-        kv_caches, layout_hints=layout_hints
-    )
-    desc = _get_descriptor(kv_caches)
-    if desc is not None and desc.kv_format in (
-        KVCacheFormat.MLA_KV,
-        KVCacheFormat.DSA_KV,
-    ):
-        # First Party — lazy: resolve the MLA format flag is_mla() accepts.
-        import lmcache_ascend.c_ops as lmc_ops
-
-        block_size, num_layers, _hidden, dtype_str, _fmt = result
-        return (
-            block_size,
-            num_layers,
-            desc.hidden,
-            dtype_str,
-            lmc_ops.EngineKVFormat.NL_X_NB_BS_HS,
-        )
-    return result
-
-
 def install_overrides() -> None:
     """Replace the upstream gather/scatter + submit callables with NPU dispatchers.
 
@@ -907,15 +856,15 @@ def install_overrides() -> None:
     ``torch_dev.synchronize()`` calls. Non-NPU / unsupported-layout workers fall
     back to the saved originals unchanged.
 
-    Finally patches ``compute_kv_layout`` (on ``base`` and ``worker_transfer``)
-    so the SHM server allocates the rank-3 buffer the fused MLA/DSA kernel
-    consumes; see :func:`_compute_kv_layout_wrapper`.
+    ``compute_kv_layout`` is NOT patched: MLA (2-tuple) and DSA (3-tuple) are
+    now detected natively by LMCache core as ``NL_X_TWO_X_NB_BS_HS``, which
+    reports the summed hidden dim + MLA flag the SHM server needs to allocate
+    the rank-3 buffer. See ``lmcache/v1/gpu_connector/kv_format``.
     """
     global _orig_gather
     global _orig_scatter
     global _orig_submit_store
     global _orig_submit_retrieve
-    global _orig_compute_kv_layout
 
     # Third Party
     import lmcache.v1.multiprocess.transfer_context.base as base
@@ -940,21 +889,8 @@ def install_overrides() -> None:
         _submit_retrieve_wrapper
     )
 
-    # LMC-A: patch compute_kv_layout so the SHM server allocates the rank-3
-    # buffer the fused MLA/DSA kernel consumes (see _compute_kv_layout_wrapper).
-    # Both base (definition) and wt (the binding register() resolves) are
-    # patched, matching the gather/scatter handling above.
-    if _orig_compute_kv_layout is None:
-        _orig_compute_kv_layout = base.compute_kv_layout
-    base.compute_kv_layout = _compute_kv_layout_wrapper  # type: ignore[assignment]
-    wt.compute_kv_layout = _compute_kv_layout_wrapper  # type: ignore[assignment]
-
     logger.info(
         "Installed NPU fused gather/scatter + transfer-stream submit override "
         "for MP non-GPU transfer (supported formats: %s)",
         ", ".join(f.name for f in _SUPPORTED_FORMATS),
-    )
-    logger.info(
-        "Installed NPU MLA/DSA chunk-shape negotiation patch "
-        "(compute_kv_layout) for MP engine-driven transfer"
     )
