@@ -8,11 +8,17 @@ import threading
 
 # Third Party
 from lmcache.logging import init_logger
-from lmcache.v1.memory_management import (
-    MemoryFormat,
-    MemoryObj,
-    MixedMemoryAllocator,
-)
+
+try:
+    # Third Party
+    from lmcache.v1.memory_allocators.mixed_memory_allocator import (
+        MixedMemoryAllocator,
+    )
+except ImportError:  # upstream <= #4077 exposed it via memory_management
+    from lmcache.v1.memory_management import MixedMemoryAllocator
+
+# Third Party
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.rpc_utils import get_zmq_socket
 from lmcache.v1.transfer_channel.transfer_utils import (
     InitSideMsgBase,
@@ -194,7 +200,7 @@ class HcclChannel(BaseMultiBufferChannel):
         with self._staging_lock:
             for dst in mem_objs:
                 slot = self._staging_arena.allocate(
-                    dst.meta.shape, dst.meta.dtype, dst.meta.fmt
+                    dst.get_shapes(), dst.get_dtypes(), dst.meta.fmt
                 )
                 if slot is None:
                     break
@@ -275,7 +281,7 @@ class HcclChannel(BaseMultiBufferChannel):
         with self._staging_lock:
             for src in mem_objs:
                 slot = self._staging_arena.allocate(
-                    src.meta.shape, src.meta.dtype, src.meta.fmt
+                    src.get_shapes(), src.get_dtypes(), src.meta.fmt
                 )
                 if slot is None:
                     break

@@ -4,7 +4,7 @@ import re
 import subprocess
 
 # Third Party
-from lmcache.v1.multiprocess.custom_types import CudaIPCWrapper
+from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
 import torch
 
 

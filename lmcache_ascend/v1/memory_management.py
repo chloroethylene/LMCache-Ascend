@@ -6,11 +6,23 @@ import threading
 
 # Third Party
 from lmcache.logging import init_logger
-from lmcache.v1.memory_management import (
-    MemoryAllocatorInterface,
-    PagedTensorMemoryAllocator,
-    TensorMemoryAllocator,
-)
+
+try:
+    # Third Party
+    from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (
+        PagedTensorMemoryAllocator,
+    )
+    from lmcache.v1.memory_allocators.tensor_memory_allocator import (
+        TensorMemoryAllocator,
+    )
+except ImportError:  # upstream <= #4077 exposed them via memory_management
+    from lmcache.v1.memory_management import (
+        PagedTensorMemoryAllocator,
+        TensorMemoryAllocator,
+    )
+
+# Third Party
+from lmcache.v1.memory_management import MemoryAllocatorInterface
 import torch
 
 logger = init_logger(__name__)
