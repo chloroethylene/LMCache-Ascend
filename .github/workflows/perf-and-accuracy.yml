@@ -143,12 +143,14 @@ jobs:
       - name: 📦 Pre-clone LMCache Test Dependencies
         run: |
           LMCACHE_TAG=$(grep -oP 'LMCACHE_UPSTREAM_TAG\s*=\s*"\K[^"]+' lmcache_ascend/__init__.py)
-          git clone --branch "$LMCACHE_TAG" --depth 1 git@github.com:LMCache/LMCache.git /workspace/LMCache
+          git clone --branch "$LMCACHE_TAG" --depth 1 git@github.com:chloroethylene/LMCache.git /workspace/LMCache
 
       - name: 📦 Install LMCache & Build Project
         run: |
           echo ">>> Installing LMCache Core..."
-          pip install lmcache==0.4.4
+          # LMCACHE_UPSTREAM_TAG currently tracks a co-developed branch that
+          # only exists on the fork; install editable from the pre-cloned tree.
+          NO_CUDA_EXT=1 pip install -e /workspace/LMCache
 
           echo ">>> Building LMCache-Ascend..."
           export CPLUS_INCLUDE_PATH=/usr/include/c++/12:/usr/include/c++/12/backward:/usr/include/c++/12/`uname -i`-openEuler-linux/:$CPLUS_INCLUDE_PATH

@@ -14,7 +14,11 @@ from lmcache_ascend import _build_info
 
 # NOTE: Must be manually edited per each version and
 # is also used by the test infrastructure.
-LMCACHE_UPSTREAM_TAG = "v0.4.5"
+# The plugin currently tracks a co-developed (not yet released) LMCache
+# branch, so this is a git ref (branch name) rather than a release tag.
+# Once LMCache 0.5.5 is released, switch this back to the "v0.5.5" tag and
+# refresh README/Dockerfiles accordingly.
+LMCACHE_UPSTREAM_TAG = "feature/support_ascend_mp_mode_0827"
 LMCACHE_ASCEND_PATCHED = False
 # Set once _patch_lazy_memory_allocator successfully swaps the pool to
 # alloc_pinned_ptr; the patch is exception-safe and retried after _patch_ops.
