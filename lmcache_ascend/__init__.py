@@ -608,12 +608,17 @@ def _patch_remote_backend():
 
 def _patch_multi_process():
     # Third Party
-    import lmcache.v1.multiprocess.custom_types as lm_mp_types
+    from lmcache.v1.platform.npu import NpuDeviceSpec
 
     # First Party
     from lmcache_ascend.v1.multiprocess.custom_types import AscendIPCWrapper
 
-    lm_mp_types.CudaIPCWrapper = AscendIPCWrapper
+    # LMC-A: upstream now dispatches KV-cache IPC wrappers through
+    # DeviceSpec.ipc_wrapper_cls (resolve_kv_wrapper_factory) instead of the
+    # removed lmcache.v1.multiprocess.custom_types.CudaIPCWrapper rebind, so
+    # register the Ascend wrapper on the NPU spec; without this the factory
+    # raises ValueError("No KV-cache wrapper factory registered for 'npu'").
+    NpuDeviceSpec.ipc_wrapper_cls = property(lambda self: AscendIPCWrapper)
 
 
 def _patch_mp_transfer_context():
@@ -638,28 +643,29 @@ def _patch_gpu_connector():
     as a factory function. We patch it to return Ascend NPU connectors
     instead of the default CUDA ones.
 
-    ``permute_kv_caches_to_contiguous`` must be patched on
-    ``lmcache.v1.gpu_connector.utils`` *before* importing
-    ``lmcache.v1.gpu_connector``, so the import in ``gpu_connectors`` binds
-    the Ascend implementation. If ``gpu_connectors`` was already loaded,
-    also replace its cached reference (same pattern as ``CreateGPUConnector``
-    on ``lmcache.v1.manager``).
+    ``permute_kv_caches_to_contiguous`` was renamed upstream to
+    ``attempt_permute_to_contiguous_view`` (now defined in
+    ``lmcache.v1.gpu_connector.kv_format.contiguity``). Only the kvcaches-list
+    call site in ``gpu_connectors.initialize_kvcaches_ptr`` takes the Ascend
+    override (K/V-tuple and shared-pool-view handling), so the by-value import
+    inside ``gpu_connectors`` is rebound directly -- importing the module here
+    first keeps the rebind deterministic regardless of import order. The
+    single-tensor callers of the contiguity module (cuda/cpu IPC wrappers,
+    shm) must keep upstream semantics and are left untouched.
     """
     # Standard
 
     # Third Party
-    import lmcache.v1.gpu_connector.utils as gpu_utils
+    import lmcache.v1.gpu_connector.gpu_connectors as gpu_connectors_mod
 
     # First Party
     from lmcache_ascend.v1.npu_connector.utils import permute_kv_caches_to_contiguous
 
-    gpu_utils.permute_kv_caches_to_contiguous = permute_kv_caches_to_contiguous
-
-    _gpu_connectors_mod = sys.modules.get("lmcache.v1.gpu_connector.gpu_connectors")
-    if _gpu_connectors_mod is not None:
-        _gpu_connectors_mod.permute_kv_caches_to_contiguous = (
-            permute_kv_caches_to_contiguous
-        )
+    # LMC-A: rebind the renamed symbol at its (list) call site instead of the
+    # pre-import module patch the old upstream layout required.
+    gpu_connectors_mod.attempt_permute_to_contiguous_view = (
+        permute_kv_caches_to_contiguous
+    )
 
     # Third Party
     import lmcache.v1.gpu_connector as lm_gpu_connector
@@ -847,12 +853,14 @@ def _patch_sgl():
     )
 
     # Third Party
-    import lmcache.v1.memory_management as lmc_memory_management
+    from lmcache.v1.memory_allocators import gpu_memory_allocator as lmc_gpu_allocator
 
     # First Party
     from lmcache_ascend.v1.memory_management import GPUMemoryAllocator__init__
 
-    lmc_memory_management.GPUMemoryAllocator.__init__ = GPUMemoryAllocator__init__
+    # LMC-A: GPUMemoryAllocator moved out of lmcache.v1.memory_management in
+    # the upstream #4077 refactor; patch the class where it now lives.
+    lmc_gpu_allocator.GPUMemoryAllocator.__init__ = GPUMemoryAllocator__init__
 
 
 def _patch_rpc_utils():

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from typing import ClassVar
 import re
 import subprocess
 
@@ -17,6 +18,11 @@ class AscendIPCWrapper(CudaIPCWrapper):
     Potentially, we should let torch_npu to update the patch.
         we should also beware that the uuid we created might not be *unique*.
     """
+
+    #: Override the inherited ``"cuda"`` so upstream wrapper-device detection
+    #: (e.g. ``_detect_device_type`` on the LMCache server) resolves the NPU
+    #: device spec instead of misrouting to the CUDA one.
+    device_type: ClassVar[str] = "npu"
 
     def __init__(self, tensor: torch.Tensor) -> None:
         storage = tensor.untyped_storage()
