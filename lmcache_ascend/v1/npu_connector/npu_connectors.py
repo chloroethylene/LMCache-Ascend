@@ -21,14 +21,7 @@ from lmcache.v1.gpu_connector.utils import (
     normalize_and_discover_per_layer_formats,
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
-
-try:
-    # Third Party
-    from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator
-except ImportError:  # upstream <= #4077 exposed it via memory_management
-    from lmcache.v1.memory_management import GPUMemoryAllocator
-
-# Third Party
+from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 import torch

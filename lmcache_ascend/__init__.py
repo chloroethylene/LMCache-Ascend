@@ -85,22 +85,13 @@ def _patch_lazy_memory_allocator():
 
     _logger = init_logger(__name__)
     try:
-        try:
-            # Third Party
-            from lmcache.v1.memory_allocators.lazy_memory_allocator import (
-                AddressManager,
-                LazyMemoryAllocator,
-                TensorMemoryAllocator,
-                align_to,
-            )
-        except ImportError:  # upstream moved the module in the #4077 refactor
-            # Third Party
-            from lmcache.v1.lazy_memory_allocator import (
-                AddressManager,
-                LazyMemoryAllocator,
-                TensorMemoryAllocator,
-                align_to,
-            )
+        # Third Party
+        from lmcache.v1.memory_allocators.lazy_memory_allocator import (
+            AddressManager,
+            LazyMemoryAllocator,
+            TensorMemoryAllocator,
+            align_to,
+        )
     except Exception as exc:  # circular during early activation; retry later
         _logger.debug(
             "LazyMemoryAllocator patch deferred (lmcache.v1 not ready yet): %r",
@@ -421,20 +412,17 @@ def _patch_ops():
     # Standard
     from enum import IntEnum
 
-    # First Party
-    import lmcache_ascend.c_ops as ascend_c_ops
-
+    # Third Party
     # Merge fallback functions that ascend c_ops doesn't implement
     # (e.g., alloc_shm_pinned_ptr, free_shm_pinned_ptr, hugepage
     # functions).  This must happen BEFORE any downstream module
     # imports lmcache.c_ops, otherwise the bound reference will miss
     # these symbols.
-    try:
-        # Third Party
-        import lmcache.v1.platform.torch_ops as python_ops_fallback
-    except ImportError:  # upstream <= #4077 kept the standalone module
-        # Third Party
-        from lmcache import python_ops_fallback
+    import lmcache.v1.platform.torch_ops as python_ops_fallback
+
+    # First Party
+    import lmcache_ascend.c_ops as ascend_c_ops
+
     for attr_name in dir(python_ops_fallback):
         if not attr_name.startswith("__") and not hasattr(ascend_c_ops, attr_name):
             setattr(ascend_c_ops, attr_name, getattr(python_ops_fallback, attr_name))
@@ -464,12 +452,7 @@ def _patch_ops():
     # Python equivalent (same __slots__) for Ascend.
     if not hasattr(ascend_c_ops, "PageBufferShapeDesc"):
         # Third Party
-        try:
-            # Third Party
-            from lmcache.v1.platform.torch_ops import PageBufferShapeDesc
-        except ImportError:  # upstream <= #4077 kept the standalone module
-            # Third Party
-            from lmcache.python_ops_fallback import PageBufferShapeDesc
+        from lmcache.v1.platform.torch_ops import PageBufferShapeDesc
 
         ascend_c_ops.PageBufferShapeDesc = PageBufferShapeDesc
 

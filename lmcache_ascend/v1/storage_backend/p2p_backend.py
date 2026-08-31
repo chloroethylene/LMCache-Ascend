@@ -23,16 +23,9 @@ from lmcache.v1.cache_controller.message import (
     Msg,
 )
 from lmcache.v1.config import LMCacheEngineConfig
-
-try:
-    # Third Party
-    from lmcache.v1.memory_allocators.paged_cpu_gpu_memory_allocator import (
-        PagedCpuGpuMemoryAllocator,
-    )
-except ImportError:  # upstream <= #4077 exposed it via memory_management
-    from lmcache.v1.memory_management import PagedCpuGpuMemoryAllocator
-
-# Third Party
+from lmcache.v1.memory_allocators.paged_cpu_gpu_memory_allocator import (
+    PagedCpuGpuMemoryAllocator,
+)
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.rpc_utils import (

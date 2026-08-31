@@ -7,14 +7,7 @@ import random
 # Third Party
 from lmcache.utils import EngineType
 from lmcache.v1.config import LMCacheEngineConfig
-
-try:
-    # Third Party
-    from lmcache.v1.memory_allocators.pin_memory_allocator import PinMemoryAllocator
-except ImportError:  # upstream <= #4077 exposed it via memory_management
-    from lmcache.v1.memory_management import PinMemoryAllocator
-
-# Third Party
+from lmcache.v1.memory_allocators.pin_memory_allocator import PinMemoryAllocator
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.metadata import LMCacheMetadata
 

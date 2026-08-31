@@ -8,16 +8,9 @@ import threading
 
 # Third Party
 from lmcache.logging import init_logger
-
-try:
-    # Third Party
-    from lmcache.v1.memory_allocators.mixed_memory_allocator import (
-        MixedMemoryAllocator,
-    )
-except ImportError:  # upstream <= #4077 exposed it via memory_management
-    from lmcache.v1.memory_management import MixedMemoryAllocator
-
-# Third Party
+from lmcache.v1.memory_allocators.mixed_memory_allocator import (
+    MixedMemoryAllocator,
+)
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.rpc_utils import get_zmq_socket
 from lmcache.v1.transfer_channel.transfer_utils import (
