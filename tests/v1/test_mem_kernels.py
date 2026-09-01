@@ -3,7 +3,7 @@
 import random
 
 # Third Party
-from lmcache.v1.memory_management import PinMemoryAllocator
+from lmcache.v1.memory_allocators.pin_memory_allocator import PinMemoryAllocator
 from lmcache_tests.v1.utils import check_mem_obj_equal
 import pytest
 import torch
