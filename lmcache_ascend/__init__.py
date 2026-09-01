@@ -33,6 +33,72 @@ def _is_vllm_runtime():
     return "vllm" in sys.modules or any("vllm" in arg for arg in sys.argv)
 
 
+def _seed_partial_lmcache_device_ops() -> None:
+    """Bridge ``lmcache.device_ops`` while ``import lmcache`` is still running.
+
+    On the serving path the plugin is first pulled in by lmcache's own
+    platform init (``NpuDeviceOps.ensure_native`` -> ``import
+    lmcache_ascend.c_ops``), i.e. in the middle of ``import lmcache`` --
+    before ``lmcache/__init__.py`` binds its ``device_ops`` singleton (which
+    lives after the platform import that invoked us). Core modules imported
+    during the patch activation (``lmcache.v1.kv_layer_groups``,
+    ``lmcache.storage_backend.serde.cachegen_decoder``, ...) do
+    ``from lmcache import device_ops`` at module level and would raise
+    ``ImportError`` on the half-initialized package, aborting the whole
+    activation -- lmcache then soft-fails to "plugin not found" and every MP
+    transfer stays on the torch baseline (~8x slower).
+
+    Seed a lazy proxy for exactly that window: ``lmcache/__init__.py``
+    overwrites the attribute with the real singleton right after platform
+    init returns, and any proxy holder bound during the window transparently
+    delegates to it on every access. No-op whenever ``device_ops`` already
+    exists (plugin imported after lmcache finished, or plugin-first).
+    """
+    # Third Party
+    import lmcache
+
+    if hasattr(lmcache, "device_ops"):
+        return
+
+    class _LazyDeviceOpsProxy:
+        """Resolve the real ``lmcache.device_ops`` singleton per access.
+
+        Accesses before lmcache binds its singleton (module-level grabs such
+        as ``system_detection``'s ``get_gpu_pci_bus_id = device_ops.
+        get_gpu_pci_bus_id``) are served from the ascend extension directly
+        -- the same function objects ``bind_native`` later puts on the real
+        instance -- and anything the extension does not export falls back to
+        the torch-baseline method, so no caller degrades to a broken binding.
+        """
+
+        def __getattr__(self, name: str) -> Any:
+            # Standard
+            import sys
+
+            real = getattr(sys.modules.get("lmcache"), "device_ops", None)
+            if real is not None and not isinstance(real, _LazyDeviceOpsProxy):
+                return getattr(real, name)
+            # First Party
+            import lmcache_ascend.c_ops as ascend_c_ops
+
+            sym = getattr(ascend_c_ops, name, None)
+            if sym is not None:
+                return sym
+            # Third Party
+            from lmcache.v1.platform.base.device_ops import DeviceOps
+
+            return getattr(DeviceOps(), name)
+
+    # Overwritten with the real singleton by lmcache's own __init__ as soon
+    # as the platform import currently in progress returns.
+    lmcache.device_ops = _LazyDeviceOpsProxy()  # type: ignore[assignment]
+
+    # Third Party
+    from lmcache.logging import init_logger
+
+    init_logger(__name__).debug("Seeded lazy lmcache.device_ops proxy (partial import)")
+
+
 def _patch_lmcache_global_variable():
     def _detect_device() -> tuple[Any, str]:
         try:
@@ -552,13 +618,16 @@ def _patch_cachegen():
 
 def _patch_remote_backend():
     # Standard
-    from typing import List, Optional
+    from typing import TYPE_CHECKING, List, Optional
 
     # Third Party
-    from lmcache.utils import CacheEngineKey
-    from lmcache.v1.memory_management import MemoryObj
     from lmcache.v1.storage_backend.naive_serde import CacheGenDeserializer
     from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+
+    if TYPE_CHECKING:
+        # Third Party
+        from lmcache.utils import CacheEngineKey
+        from lmcache.v1.memory_management import MemoryObj
 
     # The core remote backend implementation deserializes an NPU resident tensor that
     # isn't managed by a parent allocator. To mesh with the rest of LMCache it needs to
@@ -570,8 +639,8 @@ def _patch_remote_backend():
 
     def new_batched_get_blocking(
         self,
-        keys: List[CacheEngineKey],
-    ) -> List[Optional[MemoryObj]]:
+        keys: "List[CacheEngineKey]",
+    ) -> "List[Optional[MemoryObj]]":
         source_bufs = old_batched_get_blocking(self, keys)
 
         if isinstance(self.deserializer, CacheGenDeserializer):
@@ -713,9 +782,6 @@ def _patch_metadata_get_shapes():
     from lmcache.v1.metadata import LMCacheMetadata
     import torch
 
-    # First Party
-    from lmcache_ascend.v1.kv_layer_groups import _lmc_chunk_hidden_bytes
-
     _orig_get_shapes = LMCacheMetadata.get_shapes
 
     def _get_shapes(
@@ -732,6 +798,17 @@ def _patch_metadata_get_shapes():
                 if num_tokens != self.chunk_size and physical:
                     physical = max(1, num_tokens * physical // self.chunk_size)
                 if plane_bytes is not None:
+                    # LMC-A: lazy import -- pulled at patch time this module
+                    # deadlocks on lmcache's partial init (lmcache platform's
+                    # device_ops imports this plugin mid-``import lmcache``;
+                    # kv_layer_groups then asks the half-initialized lmcache
+                    # top level for ``device_ops``). At call time lmcache is
+                    # fully initialized, so import here instead.
+                    # First Party
+                    from lmcache_ascend.v1.kv_layer_groups import (
+                        _lmc_chunk_hidden_bytes,
+                    )
+
                     token_dim = num_tokens
                     hidden = _lmc_chunk_hidden_bytes(plane_bytes, token_dim)
                 else:
@@ -916,6 +993,12 @@ if not LMCACHE_ASCEND_PATCHED:
     # Standard
     from functools import partial
     import sys
+
+    # Must run before any patch: the activation imports core modules that
+    # bind ``lmcache.device_ops`` at module level, which only exists once
+    # ``import lmcache`` finished -- and we are typically invoked from inside
+    # it (see the docstring).
+    _seed_partial_lmcache_device_ops()
 
     if _build_info.__framework_name__ == "pytorch":
         _patch_lmcache_global_variable()
