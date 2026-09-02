@@ -64,7 +64,7 @@ def _worker_process_deserialize_and_reconstruct(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.npu.is_available(),  # LMC-A: run on npu, not cuda
     reason="NPU is required for IPCWrapper multiprocessing tests",
 )
 def test_cudaipc_wrapper_multiprocess_serialization():
@@ -84,7 +84,10 @@ def test_cudaipc_wrapper_multiprocess_serialization():
     for i in range(num_tensors):
         # Create a tensor with known values
         tensor = torch.full(
-            (2, 3), fill_value=float(i + 1), dtype=torch.float32, device="cuda"
+            (2, 3),
+            fill_value=float(i + 1),
+            dtype=torch.float32,
+            device="npu",  # LMC-A: run on npu, not cuda
         )
         tensors.append(tensor)
         wrapper = AscendIPCWrapper(tensor)

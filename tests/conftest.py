@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import glob as _glob
 import importlib
 import os
+import os as _os
 import sys
 
 # Third Party
@@ -12,8 +14,22 @@ import pytest
 # We import the function we just created to handle the git/alias logic
 from .bootstrap import TEST_ALIAS, prepare_environment
 
-# Skip multiprocess tests entirely — NPU does not support IPC sharing
-collect_ignore_glob = ["v1/multiprocess/test_*.py"]
+# LMC-A: multiprocess tests were skipped wholesale ("NPU does not support IPC
+# sharing"). Cross-process IPC now works (AscendIPCWrapper + torch_npu event
+# handles), so keep the two NPU-capable files collected and skip the rest,
+# which still exercise CUDA-only paths.
+_MP_KEEP = {
+    "test_custom_types.py",
+    "test_npu_lmcache_driven_e2e.py",
+}
+_MP_DIR = _os.path.normpath(
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "v1", "multiprocess")
+)
+collect_ignore = sorted(
+    path
+    for path in _glob.glob(_os.path.join(_MP_DIR, "test_*.py"))
+    if _os.path.basename(path) not in _MP_KEEP
+)
 
 # ==============================================================================
 # 1. RUN BOOTSTRAP
