@@ -5,10 +5,11 @@ import re
 import subprocess
 
 # Third Party
-from lmcache.logging import init_logger
+from lmcache.logging import init_logger  # LMC-A: warn+skip on probe failure
 from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
 import torch
 
+# LMC-A: logger for the warn+skip device-discovery path below
 logger = init_logger(__name__)
 
 
@@ -89,6 +90,8 @@ class AscendIPCWrapper(CudaIPCWrapper):
                 return  # Already discovered
 
             for i in range(num_devices):
+                # LMC-A: tolerate per-device npu-smi probe failure (16
+                # logical vs 8 physical IDs) -- see below.
                 # torch.npu.device_count() reports LOGICAL devices while
                 # npu-smi addresses PHYSICAL card IDs, so the two ranges can
                 # diverge (e.g. 16 logical devices on 8 cards): ordinals past
