@@ -5,8 +5,11 @@ import re
 import subprocess
 
 # Third Party
+from lmcache.logging import init_logger
 from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
 import torch
+
+logger = init_logger(__name__)
 
 
 class AscendIPCWrapper(CudaIPCWrapper):
@@ -86,7 +89,21 @@ class AscendIPCWrapper(CudaIPCWrapper):
                 return  # Already discovered
 
             for i in range(num_devices):
-                device_uuid = AscendIPCWrapper._get_device_uuid(i)
+                # torch.npu.device_count() reports LOGICAL devices while
+                # npu-smi addresses PHYSICAL card IDs, so the two ranges can
+                # diverge (e.g. 16 logical devices on 8 cards): ordinals past
+                # the last card make npu-smi fail. Skip those instead of
+                # aborting wrapper construction on the whole host.
+                try:
+                    device_uuid = AscendIPCWrapper._get_device_uuid(i)
+                except RuntimeError:
+                    logger.warning(
+                        "Skipping NPU device ordinal %d during UUID discovery:"
+                        " npu-smi could not resolve it (logical device count"
+                        " exceeds the physical card IDs)",
+                        i,
+                    )
+                    continue
                 AscendIPCWrapper._discovered_device_mapping[device_uuid] = i
 
     @staticmethod
