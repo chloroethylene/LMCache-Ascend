@@ -17,7 +17,10 @@ prepare_environment()
 
 # Third Party
 from lmcache.logging import init_logger
-from lmcache.v1.memory_management import MemoryFormat, PagedCpuGpuMemoryAllocator
+from lmcache.v1.memory_allocators.paged_cpu_gpu_memory_allocator import (
+    PagedCpuGpuMemoryAllocator,
+)
+from lmcache.v1.memory_management import MemoryFormat
 import pytest
 import torch
 

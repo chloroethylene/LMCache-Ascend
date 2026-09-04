@@ -17,9 +17,6 @@ from tests.bootstrap import prepare_environment
 prepare_environment()
 
 # Third Party
-# NOTE (gingfung): at this point,
-# the CudaIPCWrapper should be patched already.
-from lmcache.v1.multiprocess.custom_types import CudaIPCWrapper  # noqa: E402
 from lmcache_tests.v1.multiprocess.test_custom_types import (  # noqa: F401, E402
     get_customized_decoder,
     get_customized_encoder,
@@ -28,18 +25,24 @@ from lmcache_tests.v1.multiprocess.test_custom_types import (  # noqa: F401, E40
     test_ipc_cache_engine_key_serialization,
 )
 
+# First Party
+# LMC-A: upstream moved wrapper dispatch to DeviceSpec.ipc_wrapper_cls
+# (lmcache #4077-era refactor); the NPU wrapper now lives only in the plugin,
+# so import it directly instead of the vanished custom_types.CudaIPCWrapper.
+from lmcache_ascend.v1.multiprocess.custom_types import AscendIPCWrapper  # noqa: E402
+
 
 def _worker_process_deserialize_and_reconstruct(
     encoded_data: bytes, result_queue: Queue
 ):
     """
     Worker function that runs in a separate process.
-    Deserializes CudaIPCWrapper list and reconstructs tensors.
+    Deserializes AscendIPCWrapper list and reconstructs tensors.
     """
     try:
         # Decode the list of wrappers
         torch.npu.init()
-        decoder = get_customized_decoder(type=list[CudaIPCWrapper])
+        decoder = get_customized_decoder(type=list[AscendIPCWrapper])
         decoded_wrappers = decoder.decode(encoded_data)
 
         # Convert each wrapper back to tensor and compute checksum
@@ -61,12 +64,12 @@ def _worker_process_deserialize_and_reconstruct(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.npu.is_available(),  # LMC-A: run on npu, not cuda
     reason="NPU is required for IPCWrapper multiprocessing tests",
 )
 def test_cudaipc_wrapper_multiprocess_serialization():
     """
-    Test CudaIPCWrapper serialization across processes using spawn method.
+    Test AscendIPCWrapper serialization across processes using spawn method.
     This verifies that CUDA IPC handles can be properly shared between processes.
     """
     # Set multiprocessing start method to spawn
@@ -81,10 +84,13 @@ def test_cudaipc_wrapper_multiprocess_serialization():
     for i in range(num_tensors):
         # Create a tensor with known values
         tensor = torch.full(
-            (2, 3), fill_value=float(i + 1), dtype=torch.float32, device="cuda"
+            (2, 3),
+            fill_value=float(i + 1),
+            dtype=torch.float32,
+            device="npu",  # LMC-A: run on npu, not cuda
         )
         tensors.append(tensor)
-        wrapper = CudaIPCWrapper(tensor)
+        wrapper = AscendIPCWrapper(tensor)
         wrappers.append(wrapper)
 
         # Store expected checksum and shape
@@ -93,7 +99,7 @@ def test_cudaipc_wrapper_multiprocess_serialization():
         test_data.append((expected_checksum, expected_shape))
 
     # Serialize the wrappers
-    encoder = get_customized_encoder(type=list[CudaIPCWrapper])
+    encoder = get_customized_encoder(type=list[AscendIPCWrapper])
     encoded_data = encoder.encode(wrappers)
 
     # Create a queue for results
