@@ -581,7 +581,19 @@ def _patch_ops():
             if hasattr(ascend_c_ops, _plan_name):
                 setattr(dop, _plan_name, getattr(ascend_c_ops, _plan_name))
 
-    sys.modules["lmcache.c_ops"] = ascend_c_ops
+    # Legacy alias for pre-#4957 upstream, which ships its own lmcache.c_ops
+    # and dispatches through it. Newer upstream removed the module and asserts
+    # it stays unimportable (tests/v1/platform/test_device_ops.py), so only
+    # install the alias when the module actually exists.
+    # Standard
+    import importlib.util
+
+    try:
+        has_legacy_c_ops = importlib.util.find_spec("lmcache.c_ops") is not None
+    except ModuleNotFoundError:
+        has_legacy_c_ops = False
+    if has_legacy_c_ops:
+        sys.modules["lmcache.c_ops"] = ascend_c_ops
 
     try:
         import lmcache.v1.multiprocess.modules.lmcache_driven_transfer as _ldt
