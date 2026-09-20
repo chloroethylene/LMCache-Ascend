@@ -6,6 +6,7 @@ from ._version import __version__ as __version__  # noqa: F401  # isort:skip
 from ._version import __version_tuple__ as __version_tuple__  # noqa: F401  # isort:skip
 
 # Standard
+from functools import partial
 from typing import Any
 import sys
 
@@ -1054,12 +1055,24 @@ def _patch_api_server():
     InternalAPIServer.__init__ = InternalAPIServer__init__
 
 
-# Check if we've already patched to avoid redundant work
-if not LMCACHE_ASCEND_PATCHED:
+def _lmcache_core_ready() -> bool:
+    """Whether lmcache is past the platform-init window.
+
+    ``lmcache.v1.gpu_connector``'s package init imports ``torch_dev`` from
+    ``lmcache``, which is only bound once platform detection returned. When
+    this module is imported through the ``lmcache.device_plugins`` entry
+    point, that call is still on the stack, so activation must wait.
+    """
     # Standard
-    from functools import partial
     import sys
 
+    core = sys.modules.get("lmcache")
+    return core is None or hasattr(core, "torch_dev")
+
+
+def _apply_patches() -> None:
+    """Apply every monkey patch once, guarded by LMCACHE_ASCEND_PATCHED."""
+    global LMCACHE_ASCEND_PATCHED
     # Must run before any patch: the activation imports core modules that
     # bind ``lmcache.device_ops`` at module level, which only exists once
     # ``import lmcache`` finished -- and we are typically invoked from inside
@@ -1123,5 +1136,22 @@ if not LMCACHE_ASCEND_PATCHED:
     if _build_info.__framework_name__ == "mindspore":
         # First Party
         import lmcache_ascend.mindspore  # noqa: F401
-
     LMCACHE_ASCEND_PATCHED = True
+
+
+_ACTIVATION_PENDING = False
+
+if not LMCACHE_ASCEND_PATCHED:
+    if _lmcache_core_ready():
+        _apply_patches()
+    else:
+        _ACTIVATION_PENDING = True
+
+
+def _run_pending_activation() -> None:
+    """Flush a deferred activation; no-op once patches are applied."""
+    global _ACTIVATION_PENDING
+    if _ACTIVATION_PENDING and _lmcache_core_ready():
+        _ACTIVATION_PENDING = False
+        if not LMCACHE_ASCEND_PATCHED:
+            _apply_patches()

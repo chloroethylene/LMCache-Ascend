@@ -37,6 +37,9 @@ homepage = "https://docs.lmcache.ai"
 source = "https://github.com/LMCache/LMCache-Ascend"
 issues = "https://github.com/LMCache/LMCache-Ascend"
 
+[project.entry-points."lmcache.device_plugins"]
+ascend = "lmcache_ascend.device_plugin:AscendDeviceSpec"
+
 [tool.setuptools_scm]
 version_file = "lmcache_ascend/_version.py"
 # do not include +gREV local version, required for Test PyPI upload
