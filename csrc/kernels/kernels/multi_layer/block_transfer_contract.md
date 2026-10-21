@@ -15,6 +15,7 @@ host layer enforces it and rejects violations with `TORCH_CHECK`.
 
 | Format | Enum | `separate_plane` | Work item | LMC layout |
 |---|---|---|---|---|
+| 13 | `NL_X_NB_BS_NH_CS` | `false` | (layer, block) | `[L, T, NH*CS]`, one fused K/V plane |
 | 16 | `NL_X_TWO_X_NB_BS_NH_HS` | `true` | (layer, plane, block) | `[2, L, T, NH*HS]`, K slab then V slab |
 | 17 | `NL_X_NP_X_NB_BS_ONE_HS` | `false` | (layer, block), all planes moved by one core | `[L, T, sum(payload)]` packed byte rows |
 
@@ -28,8 +29,13 @@ cache lines with their row neighbours).
 Geometry (`prepare_group`, resolved once per group):
 
 - `nl, nb, bs, nh, hs > 0`; `element_size in {1, 2, 4}`
-- `kv_size == 2` for format 16, `== 1` for format 17
-- `1 <= num_planes <= 4`; exactly `2` for format 16; `nh == 1` for format 17
+- `kv_size == 2` for format 16, `== 1` for formats 13 and 17
+- formats 16/17 carry explicit plane geometry from registration:
+  `1 <= num_planes <= 4`, exactly `2` for format 16; `nh == 1` for format 17.
+  Format 13 is a single fused plane whose geometry is derived in
+  `prepare_group` from the scalar fields (`num_planes == 1`,
+  `payload_bytes == nh * hs * element_size`, block stride from
+  `block_stride_elems` or the tight `bs * payload_bytes` fallback).
 - per plane: `payload_bytes > 0` and
   `AlignUp32(payload_bytes) <= ub_segment` (one aligned row of every plane
   fits one queue slot), where `ub_segment` is the host-queried UB budget
@@ -37,7 +43,7 @@ Geometry (`prepare_group`, resolved once per group):
 - per plane: `engine_block_stride_bytes >= bs * payload_bytes` (no block
   overlap) and `engine_block_stride_bytes % 32 == 0`
 - address-range probe `(nb - 1) * block_stride + bs * payload` fits int64
-- format 16: `payload_bytes == nh * hs * element_size` per plane
+- formats 13/16: `payload_bytes == nh * hs * element_size` per plane
 - format 17: `sum(payload_bytes) == nh * hs * element_size`
   (the packed row width)
 - `bs * lmc_row_bytes % 32 == 0` (adjacent LMC pages do not share a 32B line)

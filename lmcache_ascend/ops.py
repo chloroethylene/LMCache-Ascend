@@ -4,10 +4,10 @@
 Mirrors upstream's ``lmcache.cuda_ops`` contract: ops plus
 ``PageBufferShapeDesc`` only. The compiled ``c_ops`` additionally exports
 the format enums and ``is_*`` predicates that upstream keeps on
-``lmcache_native`` alone, and ``_patch_ops`` merges torch-fallback
-re-exports onto it for names the extension lacks. Binding either through
-``bind_native`` would violate the device-ops facade contract or shadow
-the class-level NPU overrides, so both are filtered out here.
+``lmcache_native`` alone; binding them through ``bind_native`` would
+violate the device-ops facade contract or shadow the class-level NPU
+overrides, so both are filtered out here. Torch-fallback re-exports are
+filtered for the same reason.
 """
 
 # Third Party

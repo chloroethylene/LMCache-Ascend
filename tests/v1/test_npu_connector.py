@@ -34,7 +34,7 @@ import lmcache_ascend.c_ops as lmc_ops
 @pytest.mark.parametrize(
     "gpu_kv_format",
     [
-        lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,  # vllm non-MLA flash attention
+        lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,  # vllm non-MLA flash attention
     ],
 )
 def test_layerwise_vllm_paged_connector_with_npu(use_npu, gpu_kv_format):

@@ -322,67 +322,6 @@ def _patch_config():
         _utils_mod.LMCacheEngineConfig = lmcache.v1.config.LMCacheEngineConfig
 
 
-def _patch_ops():
-    # First Party
-    import lmcache_ascend.c_ops as ascend_c_ops
-
-    # Upstream CUDA pybind exports GPUKVFormat as an alias of EngineKVFormat
-    # (csrc/lmcache_native/pybind.cpp); mirror the alias so any downstream
-    # reference resolves identically.
-    if not hasattr(ascend_c_ops, "GPUKVFormat"):
-        ascend_c_ops.GPUKVFormat = ascend_c_ops.EngineKVFormat
-
-    # Native host only admits fmt 16/17.
-    _native_block = ascend_c_ops.multi_layer_block_kv_transfer
-    _fmt_16 = int(ascend_c_ops.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS)
-    _fmt_17 = int(ascend_c_ops.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS)
-
-    def multi_layer_block_kv_transfer(
-        paged_buffer_ptrs_tensor,
-        lmcache_objects_ptrs: list[int],
-        block_ids,
-        device,
-        direction,
-        shape_desc,
-        lmcache_chunk_size,
-        engine_kv_format,
-        skip_prefix_n_blocks,
-    ):
-        if int(engine_kv_format) not in (_fmt_16, _fmt_17):
-            raise NotImplementedError(
-                f"engine_kv_format={int(engine_kv_format)} is not supported "
-                f"on NPU: the native block-transfer kernel only implements "
-                f"fmt {_fmt_16} (NL_X_TWO_X_NB_BS_NH_HS) and fmt {_fmt_17} "
-                f"(NL_X_NP_X_NB_BS_ONE_HS). Check the engine KV layout."
-            )
-        return _native_block(
-            paged_buffer_ptrs_tensor,
-            lmcache_objects_ptrs,
-            block_ids,
-            device,
-            direction,
-            shape_desc,
-            lmcache_chunk_size,
-            engine_kv_format,
-            skip_prefix_n_blocks,
-        )
-
-    ascend_c_ops.multi_layer_block_kv_transfer = multi_layer_block_kv_transfer
-    # Legacy alias for pre-#4957 upstream, which ships its own lmcache.c_ops
-    # and dispatches through it. Newer upstream removed the module and asserts
-    # it stays unimportable (tests/v1/platform/test_device_ops.py), so only
-    # install the alias when the module actually exists.
-    # Standard
-    import importlib.util
-
-    try:
-        has_legacy_c_ops = importlib.util.find_spec("lmcache.c_ops") is not None
-    except ModuleNotFoundError:
-        has_legacy_c_ops = False
-    if has_legacy_c_ops:
-        sys.modules["lmcache.c_ops"] = ascend_c_ops
-
-
 def _patch_storage_backend_init():
     # Third Party
     import lmcache.v1.storage_backend as lm_storage_backend
@@ -936,7 +875,6 @@ if not LMCACHE_ASCEND_PATCHED:
     # to avoid falling into non_cuda_equivalent
     _patch_torch_capability()
 
-    _patch_ops()
     if is_vllm:
         _patch_gpu_connector()
 

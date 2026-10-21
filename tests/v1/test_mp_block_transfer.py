@@ -15,6 +15,7 @@ from typing import Any
 
 # Third Party
 import lmcache.lmcache_native as native
+import lmcache.v1.gpu_connector.utils as gpu_connector_utils
 import pytest
 import torch
 
@@ -612,6 +613,71 @@ def _build(
             nl=nl,
             pad_width=None,
         )
+    if layout in ("nh_cs_factory", "nh_cs_factory_padded"):
+        nl = nl or 2
+        if layout == "nh_cs_factory_padded" or padded:
+            nb, bs, nh, cs, stride = nb or 4, bs or 2, 2, 1024, 8192
+            dtype = torch.float32
+            pools, layers = [], []
+            for i in range(nl):
+                pool = torch.full((nb, stride), 999.0, dtype=dtype, device=device)
+                view = pool[:, : bs * nh * cs].view(nb, bs, nh, cs)
+                view.copy_(_fill_arange((nb, bs, nh, cs), dtype, device, 1000 * i))
+                pools.append(pool)
+                layers.append(view)
+            desc = gpu_connector_utils.make_page_buffer_shape_desc(
+                layers,
+                NH_CS_FMT,
+                layer_idx=0,
+                num_layers_in_group=nl,
+                num_blocks=nb,
+                block_size=bs,
+                block_stride_elems=stride,
+            )
+            return dict(
+                fmt=NH_CS_FMT,
+                desc=desc,
+                layers=layers,
+                pools=pools,
+                table=_pointer_table(layers, device),
+                obj_dtype=dtype,
+                obj_width=nh * cs,
+                kv_leading=False,
+                packed=False,
+                bs=bs,
+                nl=nl,
+                pad_width=bs * nh * cs,
+            )
+        nb, bs, nh, cs = nb or 32, bs or 32, 4, 512
+        dtype = torch.bfloat16
+        layers = [
+            _fill_arange((nb, bs, nh, cs), dtype, device, 1000 * i) for i in range(nl)
+        ]
+        # Leave the plane arrays unset (tight fallback) so prepare_group
+        # derives the fmt-13 geometry from the scalar fields.
+        desc = gpu_connector_utils.make_page_buffer_shape_desc(
+            layers,
+            NH_CS_FMT,
+            layer_idx=0,
+            num_layers_in_group=nl,
+            num_blocks=nb,
+            block_size=bs,
+        )
+        assert desc.num_planes == 0
+        return dict(
+            fmt=NH_CS_FMT,
+            desc=desc,
+            layers=layers,
+            pools=None,
+            table=_pointer_table(layers, device),
+            obj_dtype=dtype,
+            obj_width=nh * cs,
+            kv_leading=False,
+            packed=False,
+            bs=bs,
+            nl=nl,
+            pad_width=None,
+        )
     # Packed MLA (fmt 17): kg0 / kg0_bs16 / kg0_bs64 / kg0_indep
     nl = nl or 2
     bs = bs or {"kg0_bs16": 16, "kg0_bs64": 64}.get(layout, 32)
@@ -704,6 +770,26 @@ def _roundtrip_cases() -> list[Any]:
         ("kg0", "npu", False, 1, 2, 1, [1, 3], "kg0-npu-skip"),
         ("kg0", "npu", False, 0, 21, 2, list(range(64)), "kg0-npu-2chunk"),
         ("nh_cs_fmt17", "npu", False, 0, 2, 1, [0], "nh_cs-fmt17"),
+        (
+            "nh_cs_factory",
+            "npu",
+            False,
+            0,
+            2,
+            1,
+            [3, 1],
+            "fmt13-factory-tight-nh4",
+        ),
+        (
+            "nh_cs_factory_padded",
+            "npu",
+            False,
+            0,
+            2,
+            1,
+            [3, 1],
+            "fmt13-factory-padded-nh4",
+        ),
         ("kg0_indep", "npu", False, 0, 2, 1, [0], "kg0-indep-mini"),
         ("kg0_bs16", "npu", False, 0, 2, 1, [0], "kg0-bs16-chunk16"),
         ("kg0_bs64", "npu", False, 0, 2, 1, [0, 1], "kg0-bs64-chunk128"),
@@ -775,6 +861,9 @@ def test_roundtrip_restores_unskipped_selected_blocks(
     _assert_h2d_engine(
         spec["layers"], golden, block_ids, skip=skip, num_objects=num_objects
     )
+    if spec["pools"] is not None and spec["pad_width"] is not None:
+        for pool in spec["pools"]:
+            assert torch.all(pool[:, spec["pad_width"] :] == 999.0)
 
 
 # ---------------------------------------------------------------------------
@@ -856,6 +945,64 @@ def test_torch_check_raises_python_exception() -> None:
             spec["desc"],
             32,
             KG0_FMT,
+            0,
+        )
+
+
+@requires_npu
+def test_fmt13_rejects_multiple_planes() -> None:
+    """fmt 13 is one fused plane; an explicit num_planes != 1 is invalid."""
+    device = torch.device("npu:0")
+    desc = _shape_desc(
+        kv_size=1,
+        nl=1,
+        nb=4,
+        bs=2,
+        nh=2,
+        hs=8,
+        dtype=torch.float16,
+        block_stride_elems=2 * 2 * 8,
+        plane_slot_bytes=(2 * 8 * 2, 2 * 8 * 2),
+        plane_block_stride_bytes=(2 * 2 * 8 * 2, 2 * 2 * 8 * 2),
+    )
+    with pytest.raises(RuntimeError, match="single fused plane"):
+        lmc_ops.multi_layer_block_kv_transfer(
+            torch.empty(1, dtype=torch.int64, device=device),
+            [],
+            torch.empty(0, dtype=torch.int64, device=device),
+            device,
+            D2H,
+            desc,
+            2,
+            NH_CS_FMT,
+            0,
+        )
+
+
+@requires_npu
+@pytest.mark.parametrize("fmt,kv_size", [(SEP_KV_FMT, 2), (KG0_FMT, 1)])
+def test_plane_formats_still_require_geometry(fmt: object, kv_size: int) -> None:
+    """Only fmt 13 may omit plane geometry; fmt 16/17 keep the sentinel."""
+    device = torch.device("npu:0")
+    desc = _shape_desc(
+        kv_size=kv_size,
+        nl=1,
+        nb=4,
+        bs=2,
+        nh=1,
+        hs=8,
+        dtype=torch.float16,
+    )
+    with pytest.raises(RuntimeError, match="num_planes must be in"):
+        lmc_ops.multi_layer_block_kv_transfer(
+            torch.empty(1, dtype=torch.int64, device=device),
+            [],
+            torch.empty(0, dtype=torch.int64, device=device),
+            device,
+            D2H,
+            desc,
+            2,
+            fmt,
             0,
         )
 

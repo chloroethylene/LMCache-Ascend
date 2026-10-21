@@ -66,6 +66,10 @@ def install_plane_geometry_fill() -> None:
     - fmt 16 (``NL_X_TWO_X_NB_BS_NH_HS``): per-layer ``(K, V)`` planes
       ``[NB, BS, NH, HS]``.
 
+    fmt 13 (``NL_X_NB_BS_NH_CS``) is intentionally absent: it is one fused
+    K/V plane whose geometry ``prepare_group`` derives from the scalar
+    fields (``nh == NH``, ``hs == CS``, ``kv_size == 1``).
+
     Both share the per-layer plane-tuple structure: the per-token row is
     the product of the trailing two dims (``shape[2] * shape[3] *
     element_size``; ``shape[2] == 1`` for fmt 17, reducing to its plane
